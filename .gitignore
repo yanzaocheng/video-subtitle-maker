@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local GPU environment and models (created by setup_local_gpu.py)
+gpu-env/
+gpu-setup/
+models/
+
+# Runtime data: contains your subtitles, video paths and preferences
+cache/
+history/
+work/
+uploads/
+results/
+settings.json
+*.tmp

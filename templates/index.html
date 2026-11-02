@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="asr-token" content="{{ csrf_token }}">
+  <title>视频字幕制作</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <header>
+      <div><span class="eyebrow">ASR DESKTOP · 本机字幕工作台</span><h1>视频字幕制作</h1><p>选择本机视频，提取语音、识别与翻译，自动保存 SRT 和带样式的 ASS 字幕。</p></div>
+      <span class="badge">视频不上传 · 云端或本地 GPU 识别</span>
+    </header>
+    <div class="notice"><strong>视频不会上传或复制。</strong>本机提取音频并检测语音；选择云端识别时只发送语音片段，翻译时发送字幕文本，均按服务商价格计费；本地 GPU 识别不产生识别费用。</div>
+
+    <section class="panel" aria-labelledby="source-heading">
+      <div class="section-heading"><h2 id="source-heading"><span class="step">1</span>选择视频</h2><span class="muted">大视频直接读取本机文件，不会上传</span></div>
+      <button id="pick-media" class="pick-button" disabled>选择本机视频 / 音频…</button>
+      <dl class="media-details"><div><dt>本机路径</dt><dd id="selected-path">尚未选择视频</dd></div><div><dt>媒体信息</dt><dd id="selected-info">—</dd></div></dl>
+      <p id="media-message" role="status" class="muted"></p>
+      <video id="video-preview" controls preload="metadata" hidden aria-label="本机视频预览"></video>
+      <audio id="audio-preview" controls preload="metadata" hidden aria-label="本机音频预览"></audio>
+    </section>
+
+    <section class="panel" aria-labelledby="options-heading">
+      <div class="section-heading"><h2 id="options-heading"><span class="step">2</span>识别与翻译设置</h2><span class="muted">处理整个视频</span></div>
+      <div class="settings-grid">
+        <div>
+          <label class="field-label" for="asr-engine">语音识别</label>
+          <select id="asr-engine" disabled><option value="siliconflow">云端 · 硅基流动 Qwen3-ASR-1.7B</option></select>
+          <p id="asr-note" class="muted hint-note"></p>
+          <div class="language-row spaced-block">
+            <div><label class="field-label" for="source-language">视频语言</label><select id="source-language" disabled><option value="ja">日语</option></select></div>
+            <div><label class="field-label" for="target-language">翻译成</label><select id="target-language" disabled><option value="zh-CN">简体中文</option></select></div>
+          </div>
+          <label class="check-row"><input id="skip-nonverbal" type="checkbox" checked disabled>跳过纯呻吟、喘息等语气声（仅日语，推荐）</label>
+        </div>
+        <div>
+          <label class="field-label" for="translation-quality">翻译模型</label>
+          <select id="translation-quality" disabled><option value="pro">硅基流动 · DeepSeek-V4-Pro（推荐）</option></select>
+          <label class="field-label spaced" for="context-hint">内容背景（可选）</label>
+          <input id="context-hint" type="text" maxlength="200" spellcheck="false" autocomplete="off" placeholder="例如：日本综艺节目的访谈片段；人物：……" disabled>
+          <p class="muted hint-note">告诉翻译模型视频类型和人物，帮助理解俚语、纠正误识别；会随字幕文本一起发送。</p>
+          <label class="check-row"><input id="bilingual" type="checkbox" checked disabled>同时生成双语字幕（原文 + 目标语言）</label>
+          <p id="translation-note" class="muted">选择“原文”不翻译；其他语言会产生翻译费用。</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="generate-heading">
+      <div class="section-heading"><h2 id="generate-heading"><span class="step">3</span>生成字幕</h2><span id="range-summary" class="muted"></span></div>
+      <p id="cost" class="cost-note">正在读取费用估算…</p>
+      <div class="action-row"><button id="generate" class="primary" disabled>生成字幕</button><button id="cancel-job" class="danger" disabled>取消任务</button><button id="refresh-page" hidden>刷新并同步任务</button></div>
+      <p id="generate-hint" class="muted" role="status"></p>
+      <p id="status" role="status" aria-live="polite">正在连接本机服务…</p>
+      <div id="progress-area" hidden><div class="progress-heading"><strong id="stage">等待处理</strong><span id="progress-value">0%</span></div><progress id="progress" max="100" value="0" aria-label="字幕生成进度"></progress><p id="progress-detail" class="muted"></p></div>
+      <p class="muted">取消只会阻止后续提交，已经发出的云端请求不能撤销，仍可能计费。本工具不会自动重试提交付费任务。</p>
+    </section>
+
+    <section class="panel" aria-labelledby="result-heading">
+      <div class="section-heading"><h2 id="result-heading"><span class="step">4</span>预览与编辑字幕</h2><span id="result-meta" class="muted">暂无任务</span></div>
+      <p id="partial-note" class="notice" role="status" hidden></p>
+      <p id="job-warning" class="notice" hidden></p>
+      <p id="editor-empty" class="muted">字幕生成后，可以在这里边看视频边逐条修改。</p>
+      <div id="editor" hidden>
+        <div id="video-stage" class="video-stage">
+          <video id="editor-video" controls controlslist="nofullscreen" disablepictureinpicture preload="metadata" aria-label="字幕效果预览"></video>
+          <div id="subtitle-layer" class="subtitle-layer" aria-hidden="true"><div id="subtitle-block" class="subtitle-block"></div></div>
+        </div>
+        <div class="editor-toolbar">
+          <label for="overlay-mode">画面字幕</label>
+          <select id="overlay-mode"><option value="target">目标语言</option><option value="bilingual">双语</option><option value="original">原文</option><option value="off">不显示</option></select>
+          <button id="fullscreen-preview" title="双击画面也可以全屏，按 Esc 退出">全屏预览</button>
+          <label class="check-row inline"><input id="follow-playback" type="checkbox" checked>列表跟随播放</label>
+          <span id="edit-state" class="muted" role="status"></span>
+          <span class="toolbar-spacer"></span>
+          <button id="restore-generated" hidden>恢复为生成版本</button>
+          <button id="revert-edits" disabled>撤销未保存修改</button>
+          <button id="save-edits" class="primary" disabled>保存修改</button>
+        </div>
+        <div class="style-row" role="group" aria-label="字幕样式">
+          <strong>字幕样式</strong>
+          <label>字体<select id="style-font"></select></label>
+          <label>字号<input id="style-size" type="range" min="24" max="120" step="1"><output id="style-size-value" for="style-size"></output></label>
+          <label>文字颜色<input id="style-color" type="color"></label>
+          <label>效果<select id="style-border"><option value="outline">描边</option><option value="box">半透明底框</option><option value="none">无</option></select></label>
+          <label><span id="style-outline-label">描边颜色</span><input id="style-outline-color" type="color"></label>
+          <label>位置<select id="style-position"><option value="bottom">底部</option><option value="top">顶部</option></select></label>
+          <label>距边缘<input id="style-margin" type="range" min="0" max="400" step="2"><output id="style-margin-value" for="style-margin"></output></label>
+          <button id="style-reset" class="subtle">恢复默认样式</button>
+        </div>
+        <p class="muted editor-help">点时间可从该句播放；直接修改文字，画面字幕会即时更新。播放到合适位置后点“起点”“终点”可调整时间。字幕样式用于这里的预览和导出的 .ass 字幕（SRT 不带样式，播放器会用自己的设置）。保存后会覆盖本次生成的字幕文件（Ctrl+S 也可保存）。</p>
+        <div id="cue-list" class="cue-list"></div>
+      </div>
+      <div class="download-row"><button id="download-srt" disabled>下载目标 SRT</button><button id="download-original" disabled>下载原文 SRT</button><button id="download-bilingual" disabled>下载双语 SRT</button><button id="download-txt" disabled>下载 TXT</button><button id="download-json" disabled>下载 JSON</button><button id="open-output" disabled>打开结果文件夹</button></div>
+      <p id="result-message" class="muted" role="status"></p>
+      <p id="timestamp-note" class="muted">时间轴来自本机语音检测，按停顿合并成整句，不是逐词强制对齐；可能有断句、漏字或时间偏差，使用前请核对。</p>
+      <div id="saved-area" hidden><h3>已自动保存的文件</h3><ul id="saved-files" class="saved-files"></ul></div>
+      <p id="job-stats" class="muted"></p>
+    </section>
+
+    <details class="panel settings"><summary>API Key 设置 <span id="key-status" class="muted">正在读取…</span></summary>
+      <p class="muted">Key 只保存在本机 Windows 凭据管理器，不回传已保存的 Key，不使用浏览器存储。输入框不会显示已保存的 Key。使用本地 GPU 识别并选择“原文”时不需要 Key。</p>
+      <div class="key-block">
+        <div class="key-title"><strong>硅基流动</strong><span id="key-status-siliconflow" class="muted"></span></div>
+        <div class="key-row"><label class="sr-only" for="api-key-siliconflow">硅基流动 API Key</label><input id="api-key-siliconflow" type="password" autocomplete="off" spellcheck="false" placeholder="输入新的硅基流动 sk-… Key" disabled><button id="save-key-siliconflow" disabled>保存到本机</button><button id="clear-key-siliconflow" class="subtle" disabled>清除</button></div>
+      </div>
+      <div class="key-block">
+        <div class="key-title"><strong>DeepInfra</strong><span id="key-status-deepinfra" class="muted"></span></div>
+        <div class="key-row"><label class="sr-only" for="api-key-deepinfra">DeepInfra API Key</label><input id="api-key-deepinfra" type="password" autocomplete="off" spellcheck="false" placeholder="输入 DeepInfra API Key" disabled><button id="save-key-deepinfra" disabled>保存到本机</button><button id="clear-key-deepinfra" class="subtle" disabled>清除</button></div>
+        <p class="muted hint-note">在 deepinfra.com 左侧 Keys 页面创建；账户需先充值（Billing）才能调用。</p>
+      </div>
+      <p id="key-message" role="status"></p>
+    </details>
+    <footer><span id="model-info">本机提取 / 语音检测 · 云端或本地 GPU 识别 · 可选翻译</span><span>仅连接 http://127.0.0.1:8765 · 结果与成功片段缓存保存在本机 · 关闭窗口不会自动取消任务 · 缺失片段重新生成可能计费</span></footer>
+  </main>
+</body>
+</html>
