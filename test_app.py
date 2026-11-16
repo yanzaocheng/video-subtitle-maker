@@ -10,12 +10,14 @@ from unittest.mock import patch
 
 from app import SiliconFlowClient, UserError, create_app, make_srt, safe_message, timestamped_segments
 from common import MODEL, Cancelled, check_cancel
+from demosaic import DemosaicStore, restored_name
 from media import Media
 from providers import DEEPINFRA_CHAT, DeepInfraClient
 from subtitles import DEFAULT_STYLE, export_files
 
 TEST_KEY = "sk-" + "testcredential" * 3
 DEEPINFRA_KEY = "di" + "deepinfrakey" * 3
+CUSTOM_KEY = "custom-" + "secret" * 4
 
 
 class MemoryCredentials:
@@ -42,6 +44,22 @@ class FakeClient:
     def translate(self, cues, language, api_key):
         self.translation_calls.append((cues, language))
         return {c["id"]: "你好。" for c in cues}, {"prompt_tokens": 20, "completion_tokens": 8}, "translation-trace"
+
+
+class FakeCustomClient:
+    """Stands in for the client of a user-supplied translation API; `made` lists every (endpoint, key) it was used with."""
+    made = []
+    formats = []
+    failure = None
+
+    def __init__(self, endpoint, timeout=300, api_format="chat"):
+        self.endpoint, self.timeout, self.api_format = endpoint, timeout, api_format
+
+    def translate(self, cues, language, api_key, **options):
+        FakeCustomClient.made.append((self.endpoint, api_key, options.get("model"), self.timeout))
+        FakeCustomClient.formats.append(self.api_format)
+        if FakeCustomClient.failure: raise FakeCustomClient.failure
+        return {c["id"]: "自定义译文" for c in cues}, {}, ""
 
 
 class FakeMediaLibrary:
@@ -87,7 +105,7 @@ class AppTests(unittest.TestCase):
         self.temp = TemporaryDirectory()
         self.sample = Path(self.temp.name) / "sample.mp3"
         self.sample.write_bytes(b"sample-audio")
-        self.credentials = {"siliconflow": MemoryCredentials(), "deepinfra": MemoryCredentials("")}
+        self.credentials = {"siliconflow": MemoryCredentials(), "deepinfra": MemoryCredentials(""), "custom": MemoryCredentials("")}
         self.upstream = FakeClient()
         self.library = FakeMediaLibrary()
         self.history = Path(self.temp.name) / "history"
@@ -96,8 +114,10 @@ class AppTests(unittest.TestCase):
         self.picker_value = None
         self.local_ok = (True, "")
         self.pipeline = FakePipeline(self.upstream)
+        FakeCustomClient.made, FakeCustomClient.formats, FakeCustomClient.failure = [], [], None
         self.app = create_app(self.credentials, self.upstream, self.sample, self.library, self.pipeline,
-                              lambda directory=False: self.picker_value, self.history, lambda folder: self.local_ok)
+                              lambda directory=False: self.picker_value, self.history, lambda folder: self.local_ok,
+                              custom_client=FakeCustomClient)
         self.app.testing = True
         self.http = self.app.test_client()
         self.token = re.search(r'name="asr-token" content="([^"]+)"', self.http.get("/").get_data(as_text=True)).group(1)
@@ -139,7 +159,12 @@ class AppTests(unittest.TestCase):
         self.assertIn("zh-CN", [lang["code"] for lang in config["languages"]])
         self.assertIn("ja", [lang["code"] for lang in config["source_languages"]])
         self.assertEqual(config["default_translation"], "pro")
-        self.assertEqual({m["code"] for m in config["translation_models"]}, {"pro", "flash", "deepinfra-pro", "deepinfra-flash"})
+        self.assertEqual([m["code"] for m in config["translation_models"]], ["pro", "flash", "deepinfra-pro", "deepinfra-flash", "custom"])
+        self.assertEqual(config["custom_translation"], {"configured": False, "key_saved": False, "base_url": "", "model": "",
+                                                        "api_format": "chat", "endpoint": ""})
+        self.assertEqual([(f["code"], f["path"]) for f in config["custom_formats"]],
+                         [("chat", "/chat/completions"), ("responses", "/responses"), ("messages", "/messages")])
+        self.assertEqual(config["preferences"], {})
         self.assertEqual([e["code"] for e in config["asr_engines"]], ["siliconflow", "deepinfra", "local-1.7b", "local-0.6b"])
         self.assertEqual(config["keys"], {"siliconflow": True, "deepinfra": False})
         self.assertIsNone(config["last_media"])
@@ -210,6 +235,124 @@ class AppTests(unittest.TestCase):
         self.assertEqual((options["asr_engine"], options["translation_provider"]), ("deepinfra", "deepinfra"))
         self.assertEqual(options["translation_model"], "deepseek-ai/DeepSeek-V4.1-Flash")
         self.assertEqual(keys, {"deepinfra": DEEPINFRA_KEY})
+
+    def custom(self, path="", **body):
+        return self.http.post("/api/custom-translation" + path, json=body, headers=self.headers)
+
+    def test_custom_translation_api_is_saved_and_used_with_its_own_key(self):
+        for body in ({}, {"base_url": "https://llm.example/v1"}, {"base_url": "ftp://llm.example/v1", "model": "m"},
+                     {"base_url": "https://user:pass@llm.example/v1", "model": "m"}, {"base_url": "llm.example/v1", "model": "m"},
+                     {"base_url": "https://llm.example/v1", "model": "m", "api_key": "has space"},
+                     {"base_url": "https://llm.example/v1", "model": "m\nx"}, {"base_url": "https://llm.example/v1?a=1", "model": "m"},
+                     {"base_url": "https://llm.example/v1", "model": "m", "api_format": "soap"},
+                     {"base_url": "https://llm.example/v1", "model": "m", "api_format": ["chat"]}):
+            self.assertEqual(self.custom(**body).status_code, 400, body)
+        self.assertEqual(self.http.post("/api/custom-translation", json={"base_url": "https://llm.example/v1", "model": "m"}).status_code, 403)
+        unset = self.http.post("/api/transcribe", data={"use_sample": "true", "submission_revision": "0", "target_language": "zh-CN",
+                                                        "translation_quality": "custom"}, headers=self.headers)
+        self.assertEqual(unset.status_code, 400)
+        self.assertIn("自定义 API", unset.get_json()["error"])
+        saved = self.custom(base_url=" https://llm.example/v1/ ", model=" my-model ", api_key=CUSTOM_KEY)
+        self.assertEqual(saved.status_code, 200, saved.get_data(as_text=True))
+        expected = {"configured": True, "key_saved": True, "base_url": "https://llm.example/v1/", "model": "my-model",
+                    "api_format": "chat", "endpoint": "https://llm.example/v1/chat/completions"}
+        self.assertEqual(saved.get_json()["custom_translation"], expected)
+        self.assertFalse(saved.get_json()["key_cleared"])
+        config = self.http.get("/api/config")
+        self.assertEqual(config.get_json()["custom_translation"], expected)
+        self.assertIn("my-model", config.get_json()["translation_models"][-1]["name"])
+        settings = (Path(self.temp.name) / "settings.json").read_text(encoding="utf-8")
+        for text in (saved.get_data(as_text=True), config.get_data(as_text=True), settings):
+            self.assertNotIn(CUSTOM_KEY, text)
+        self.assertEqual(self.credentials["custom"].get(), CUSTOM_KEY)
+        job = self.wait(self.start({"use_sample": "true", "target_language": "zh-CN", "translation_quality": "custom"}))
+        options, keys = self.pipeline.runs[-1]
+        self.assertEqual((options["translation_provider"], options["translation_model"], options["translation_endpoint"]),
+                         ("custom", "my-model", "https://llm.example/v1/chat/completions"))
+        # The recognition key and the custom key travel separately; the custom API never gets a built-in provider's key.
+        self.assertEqual(keys, {"siliconflow": TEST_KEY, "custom": CUSTOM_KEY})
+        self.assertEqual(job["translation_model_name"], "自定义 API · my-model")
+        self.assertEqual(json.loads(self.http.get(f"/api/jobs/{job['id']}/download/json").data)["translation_model"], "my-model")
+        self.assertNotIn(CUSTOM_KEY, next(self.history.glob("*.json")).read_text(encoding="utf-8"))
+        self.assertEqual(self.http.get("/api/config").get_json()["preferences"]["translation_quality"], "custom")
+
+    def test_custom_key_stays_with_its_server(self):
+        self.custom(base_url="https://llm.example/v1", model="a", api_key=CUSTOM_KEY)
+        same = self.custom(base_url="https://llm.example/other/v1", model="b").get_json()
+        self.assertEqual((same["key_cleared"], same["custom_translation"]["key_saved"], self.credentials["custom"].get()), (False, True, CUSTOM_KEY))
+        moved = self.custom(base_url="https://another.example/v1", model="b").get_json()
+        self.assertEqual((moved["key_cleared"], moved["custom_translation"]["key_saved"], self.credentials["custom"].get()), (True, False, ""))
+        self.wait(self.start({"use_sample": "true", "target_language": "zh-CN", "translation_quality": "custom"}))
+        self.assertEqual(self.pipeline.runs[-1][1], {"siliconflow": TEST_KEY})
+        self.custom(base_url="http://localhost:11434/v1", model="qwen", api_key=CUSTOM_KEY)
+        cleared = self.custom("/clear").get_json()
+        self.assertEqual(cleared["custom_translation"], {"configured": False, "key_saved": False, "base_url": "", "model": "",
+                                                         "api_format": "chat", "endpoint": ""})
+        self.assertEqual(self.credentials["custom"].get(), "")
+
+    def test_custom_api_format_decides_the_address_and_reaches_the_client(self):
+        # The same gateway serves its models on different kinds of endpoint; the key stays, only the format changes.
+        self.custom(base_url="https://gateway.example/v1", model="gpt-x", api_key=CUSTOM_KEY)
+        saved = self.custom(base_url="https://gateway.example/v1", model="gpt-x", api_format="responses").get_json()
+        self.assertEqual((saved["custom_translation"]["api_format"], saved["custom_translation"]["endpoint"], saved["key_cleared"],
+                          saved["custom_translation"]["key_saved"]), ("responses", "https://gateway.example/v1/responses", False, True))
+        self.assertEqual(json.loads((Path(self.temp.name) / "settings.json").read_text(encoding="utf-8"))["custom_translation"],
+                         {"base_url": "https://gateway.example/v1", "model": "gpt-x", "api_format": "responses"})
+        self.wait(self.start({"use_sample": "true", "target_language": "zh-CN", "translation_quality": "custom"}))
+        options = self.pipeline.runs[-1][0]
+        self.assertEqual((options["translation_endpoint"], options["translation_format"]), ("https://gateway.example/v1/responses", "responses"))
+        # The test button uses the format of the form, with the key saved for that server.
+        self.custom("/test", base_url="https://gateway.example", model="claude-x", api_format="messages")
+        self.assertEqual((FakeCustomClient.made[-1], FakeCustomClient.formats[-1]),
+                         (("https://gateway.example/v1/messages", CUSTOM_KEY, "claude-x", 60), "messages"))
+        # Settings saved before formats existed keep meaning Chat Completions.
+        (Path(self.temp.name) / "settings.json").write_text(json.dumps({"custom_translation": {"base_url": "https://old.example/v1", "model": "m"}}), encoding="utf-8")
+        old = self.http.get("/api/config").get_json()["custom_translation"]
+        self.assertEqual((old["api_format"], old["endpoint"]), ("chat", "https://old.example/v1/chat/completions"))
+
+    def test_custom_api_test_uses_the_form_and_never_another_servers_key(self):
+        self.custom(base_url="https://llm.example/v1", model="a", api_key=CUSTOM_KEY)
+        ok = self.custom("/test", base_url="https://llm.example/v1", model="b")
+        self.assertEqual(ok.status_code, 200, ok.get_data(as_text=True))
+        self.assertEqual((ok.get_json()["translation"], ok.get_json()["used_key"]), ("自定义译文", True))
+        self.assertEqual(FakeCustomClient.made[-1], ("https://llm.example/v1/chat/completions", CUSTOM_KEY, "b", 60))
+        self.custom("/test", base_url="http://127.0.0.1:1234/v1", model="local")
+        self.assertEqual(FakeCustomClient.made[-1], ("http://127.0.0.1:1234/v1/chat/completions", "", "local", 60))
+        self.custom("/test", base_url="http://127.0.0.1:1234/v1", model="local", api_key="typed-key")
+        self.assertEqual(FakeCustomClient.made[-1][1], "typed-key")
+        # Testing changes nothing that is saved.
+        self.assertEqual(self.http.get("/api/config").get_json()["custom_translation"]["model"], "a")
+        FakeCustomClient.failure = UserError("自定义接口 HTTP 401：bad key " + CUSTOM_KEY)
+        failed = self.custom("/test", base_url="https://llm.example/v1", model="a")
+        self.assertEqual(failed.status_code, 400)
+        self.assertIn("HTTP 401", failed.get_json()["error"])
+        self.assertNotIn(CUSTOM_KEY, failed.get_data(as_text=True))
+        self.assertEqual(self.custom("/test", base_url="not a url", model="a").status_code, 400)
+
+    def test_progress_polls_leave_out_the_subtitles_until_the_job_ends(self):
+        self.upstream.hold = Event()
+        ident = self.start()
+        running = self.http.get(f"/api/jobs/{ident}").get_json()["job"]
+        self.assertEqual(running["status"], "running")
+        self.assertFalse({"cues", "text"} & set(running))
+        self.upstream.hold.set()
+        done = self.wait(ident)
+        self.assertEqual((done["text"], len(done["cues"])), ("こんにちは。", 1))
+
+    def test_the_next_visit_starts_from_the_last_jobs_options(self):
+        self.credentials["deepinfra"].set(DEEPINFRA_KEY)
+        self.wait(self.start({"use_sample": "true", "asr_engine": "local-0.6b", "source_language": "ja", "target_language": "zh-TW",
+                              "translation_quality": "deepinfra-flash", "bilingual": "false", "skip_nonverbal": "true"}))
+        expected = {"asr_engine": "local-0.6b", "source_language": "ja", "target_language": "zh-TW",
+                    "translation_quality": "deepinfra-flash", "bilingual": False, "skip_nonverbal": True}
+        self.assertEqual(self.http.get("/api/config").get_json()["preferences"], expected)
+        # The page sends both checkboxes as off when they do not apply; that is not a choice to remember.
+        self.wait(self.start({"use_sample": "true", "asr_engine": "local-0.6b", "source_language": "en", "target_language": "original",
+                              "translation_quality": "deepinfra-flash", "bilingual": "true", "skip_nonverbal": "false"}))
+        expected.update(source_language="en", target_language="original")
+        self.assertEqual(self.http.get("/api/config").get_json()["preferences"], expected)
+        restarted = create_app(self.credentials, self.upstream, self.sample, FakeMediaLibrary(), FakePipeline(self.upstream), history_dir=self.history)
+        self.assertEqual(restarted.test_client().get("/api/config").get_json()["preferences"], expected)
 
     def test_local_gpu_needs_no_key_and_reports_unavailable(self):
         self.credentials["siliconflow"].clear()
@@ -443,6 +586,146 @@ class AppTests(unittest.TestCase):
         latest = restored.test_client().get("/api/config").get_json()["latest_job"]
         self.assertEqual(latest["status"], "done")
         self.assertEqual(len(self.upstream.calls), count)
+
+
+class FakeRemover:
+    def __init__(self):
+        self.hold = None
+        self.available = (True, "")
+        self.runs = []
+
+    def status(self):
+        return self.available
+
+    def run(self, media, sample_start, update, cancel):
+        self.runs.append(sample_start)
+        update(stage="去马赛克：1 / 2 帧", progress=50)
+        while self.hold is not None and not self.hold.wait(0.02):
+            check_cancel(cancel)
+        check_cancel(cancel)
+        output = media.path.with_name(restored_name(media.path, sample_start))
+        output.write_bytes(b"restored-video")
+        return output
+
+
+class DemosaicApiTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.exports = root / "exports"
+        self.exports.mkdir()
+        self.video = root / "movie.mkv"
+        self.video.write_bytes(b"local-video")
+        self.audio = root / "talk.mp3"
+        self.audio.write_bytes(b"audio")
+        self.upstream = FakeClient()
+        self.remover = FakeRemover()
+        self.picker_value = None
+        self.app = create_app({"siliconflow": MemoryCredentials(), "deepinfra": MemoryCredentials("")}, self.upstream, None,
+                              FakeMediaLibrary(), FakePipeline(self.upstream), lambda directory=False: self.picker_value,
+                              root / "history", lambda folder: (True, ""), demosaic=DemosaicStore(self.remover))
+        self.app.testing = True
+        self.http = self.app.test_client()
+        self.token = re.search(r'name="asr-token" content="([^"]+)"', self.http.get("/").get_data(as_text=True)).group(1)
+        self.headers = {"X-ASR-Token": self.token}
+
+    def tearDown(self):
+        if self.remover.hold:
+            self.remover.hold.set()
+        for store in (self.app.extensions["asr_jobs"], self.app.extensions["asr_demosaic"]):
+            for job in store.jobs.values():
+                for _ in range(200):
+                    if job.status != "running": break
+                    time.sleep(0.01)
+        self.temp.cleanup()
+
+    def pick(self, path):
+        self.picker_value = str(path)
+        return self.http.post("/api/media/pick", headers=self.headers).get_json()["media"]["id"]
+
+    def restore(self, media_id, **fields):
+        response = self.http.post("/api/demosaic", json={"media_id": media_id, **fields}, headers=self.headers)
+        self.assertEqual(response.status_code, 202, response.get_data(as_text=True))
+        return response.get_json()["job"]["id"]
+
+    def wait_restore(self, ident):
+        for _ in range(300):
+            job = self.http.get(f"/api/demosaic/{ident}").get_json()["job"]
+            if job["status"] != "running": return job
+            time.sleep(0.01)
+        self.fail("Fake restoration did not finish")
+
+    def subtitles(self, media_id):
+        form = {"media_id": media_id, "target_language": "zh-CN", "bilingual": "true", "output_dir": str(self.exports),
+                "submission_revision": str(self.app.extensions["asr_jobs"].revision)}
+        response = self.http.post("/api/transcribe", data=form, headers=self.headers)
+        self.assertEqual(response.status_code, 202, response.get_data(as_text=True))
+        ident = response.get_json()["job"]["id"]
+        for _ in range(300):
+            job = self.http.get(f"/api/jobs/{ident}").get_json()["job"]
+            if job["status"] != "running": return job
+            time.sleep(0.01)
+        self.fail("Fake subtitle job did not finish")
+
+    def test_restored_video_gets_its_own_subtitles_and_edits_reach_them(self):
+        media_id = self.pick(self.video)
+        job = self.subtitles(media_id)
+        done = self.wait_restore(self.restore(media_id))
+        self.assertEqual((done["status"], done["output_name"]), ("done", "movie.restored.mp4"))
+        self.assertEqual(self.remover.runs, [None])
+        expected = ["movie.restored.source.srt", "movie.restored.zh-CN.ass", "movie.restored.zh-CN.bilingual.ass",
+                    "movie.restored.zh-CN.bilingual.srt", "movie.restored.zh-CN.srt"]
+        self.assertEqual(sorted(Path(p).name for p in done["subtitle_files"]), expected)
+        self.assertTrue(all(Path(p).parent == self.video.parent for p in done["subtitle_files"]))
+        copy = self.video.with_name("movie.restored.zh-CN.srt")
+        self.assertIn("你好。", copy.read_text(encoding="utf-8"))
+        cues = [{"start": c["start"], "end": c["end"], "text": "改过的字幕", "original_text": c["original_text"]} for c in job["cues"]]
+        saved = self.http.post(f"/api/jobs/{job['id']}/segments", json={"cues": cues}, headers=self.headers)
+        self.assertEqual(saved.status_code, 200, saved.get_data(as_text=True))
+        self.assertIn("改过的字幕", copy.read_text(encoding="utf-8"))
+        self.assertIn("改过的字幕", self.video.with_name("movie.restored.zh-CN.bilingual.ass").read_text(encoding="utf-8"))
+        self.assertEqual(len(saved.get_json()["job"]["saved_files"]), 11)
+        response = self.http.get(f"/api/demosaic/{done['id']}/media")
+        self.assertEqual(response.data, b"restored-video")
+        response.close()
+
+    def test_subtitles_made_after_restoring_are_copied_too(self):
+        media_id = self.pick(self.video)
+        self.wait_restore(self.restore(media_id))
+        job = self.subtitles(media_id)
+        copies = [f for f in job["saved_files"] if Path(f["path"]).name.startswith("movie.restored.")]
+        self.assertEqual(len(copies), 5)
+        self.assertTrue(all(f.get("video", "").endswith("movie.restored.mp4") for f in copies))
+
+    def test_sample_needs_no_subtitle_copies_and_is_named_by_its_start(self):
+        media_id = self.pick(self.video)
+        self.subtitles(media_id)
+        done = self.wait_restore(self.restore(media_id, sample_start=2))
+        self.assertEqual((done["output_name"], done["sample"], done["subtitle_files"]), ("movie.restored.sample-0h00m02s.mp4", True, []))
+
+    def test_validation_one_job_at_a_time_and_cancel(self):
+        config = self.http.get("/api/config").get_json()
+        self.assertEqual(config["demosaic"], {"available": True, "reason": "", "sample_seconds": 60})
+        self.assertIsNone(config["latest_demosaic"])
+        media_id = self.pick(self.video)
+        for body in ({"media_id": self.pick(self.audio)}, {}, {"media_id": "missing"}, {"media_id": media_id, "sample_start": 10},
+                     {"media_id": media_id, "sample_start": -1}, {"media_id": media_id, "sample_start": True}):
+            self.assertEqual(self.http.post("/api/demosaic", json=body, headers=self.headers).status_code, 400, body)
+        self.assertEqual(self.http.post("/api/demosaic", json={"media_id": media_id}).status_code, 403)
+        self.remover.hold = Event()
+        ident = self.restore(media_id)
+        self.assertEqual(self.http.post("/api/demosaic", json={"media_id": media_id}, headers=self.headers).status_code, 409)
+        self.assertEqual(self.http.get("/api/config").get_json()["latest_demosaic"]["status"], "running")
+        self.assertTrue(self.http.post(f"/api/demosaic/{ident}/cancel", headers=self.headers).get_json()["job"]["cancel_requested"])
+        job = self.wait_restore(ident)
+        self.assertEqual(job["status"], "cancelled")
+        self.assertFalse(self.video.with_name("movie.restored.mp4").exists())
+        self.assertEqual(self.http.get(f"/api/demosaic/{ident}/media").status_code, 404)
+        self.assertEqual(self.http.get("/api/demosaic/unknown").status_code, 404)
+        self.remover.available = (False, "去马赛克组件未安装")
+        response = self.http.post("/api/demosaic", json={"media_id": media_id}, headers=self.headers)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("未安装", response.get_json()["error"])
 
 
 class FormatTests(unittest.TestCase):

@@ -16,6 +16,33 @@ MODELS = ROOT / "models"
 _gpu_cache = {"at": 0.0, "value": None}
 
 
+class GpuGate:
+    """Lets one GPU-heavy task (local recognition or mosaic removal) use the graphics card at a time."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.holder = ""
+
+    def acquire(self, holder, cancel, waiting=None):
+        if not self._lock.acquire(blocking=False):
+            if waiting is not None:
+                waiting(self.holder or "另一个任务")
+            while not self._lock.acquire(timeout=0.2):
+                check_cancel(cancel)
+        self.holder = holder
+
+    def release(self):
+        self.holder = ""
+        self._lock.release()
+
+    def busy(self):
+        return self._lock.locked()
+
+
+# 8 GB cards cannot hold the recognition model and the mosaic models at the same time.
+GPU_GATE = GpuGate()
+
+
 def local_status(folder, python=GPU_PYTHON, models=MODELS):
     if not Path(python).is_file():
         return False, "本地 GPU 环境未安装"
@@ -45,11 +72,12 @@ def gpu_memory():
 class LocalAsrEngine:
     """Owns one worker process that keeps the model on the GPU for the duration of a job."""
 
-    def __init__(self, folder, batch_size=4, python=GPU_PYTHON, worker=WORKER, models=MODELS, log_dir=None):
+    def __init__(self, folder, batch_size=4, python=GPU_PYTHON, worker=WORKER, models=MODELS, log_dir=None, gate=GPU_GATE):
         self.folder, self.batch_size = folder, batch_size
         self.python, self.worker, self.models = Path(python), Path(worker), Path(models)
         self.log_dir = Path(log_dir or Path(os.environ.get("LOCALAPPDATA", ROOT)) / "ASR-Web" / "logs")
         self.process, self.reader, self.lines, self.counter, self.info = None, None, queue.Queue(), 0, {}
+        self.gate, self.holding = gate, False
 
     def _read(self):
         for raw in self.process.stdout:
@@ -85,14 +113,22 @@ class LocalAsrEngine:
         if not ok:
             raise UserError(reason + "，请改用云端识别或重新安装本地 GPU 组件。")
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        if self.gate is not None and not self.holding:
+            self.gate.acquire("本地语音识别", cancel, lambda holder: progress(
+                f"等待显卡空闲：{holder}正在使用显卡，完成后自动开始识别（也可以取消后改用云端识别）"))
+            self.holding = True
         env = os.environ.copy()
         env.update(PYTHONNOUSERSITE="1", PYTHONUTF8="1", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
         progress("正在把本地识别模型加载到显卡（约 20～60 秒）")
-        with (self.log_dir / "local-asr.log").open("ab") as log:
-            self.process = subprocess.Popen(
-                [str(self.python), "-s", "-u", str(self.worker), str(self.models / self.folder)],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, cwd=str(self.worker.parent), env=env,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        try:
+            with (self.log_dir / "local-asr.log").open("ab") as log:
+                self.process = subprocess.Popen(
+                    [str(self.python), "-s", "-u", str(self.worker), str(self.models / self.folder)],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, cwd=str(self.worker.parent), env=env,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        except OSError:
+            self.close()
+            raise UserError("无法启动本地识别进程。") from None
         self.reader = threading.Thread(target=self._read, daemon=True)
         self.reader.start()
         self.info = self._wait(lambda m: m.get("ready"), 600, cancel)
@@ -141,8 +177,15 @@ class LocalAsrEngine:
     def close(self, force=False):
         """Stop the worker and free GPU memory; force skips the graceful shutdown (cancel, timeout)."""
         process, self.process = self.process, None
-        if process is None:
-            return
+        try:
+            if process is not None:
+                self._stop(process, force)
+        finally:
+            if self.holding:
+                self.holding = False
+                self.gate.release()
+
+    def _stop(self, process, force):
         try:
             process.stdin.close()
         except OSError:

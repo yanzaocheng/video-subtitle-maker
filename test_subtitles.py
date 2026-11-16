@@ -1,19 +1,24 @@
+from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event, Lock
+from unittest.mock import patch
 import json
 import subprocess
+import time
 import unittest
+import urllib.error
 import wave
 
 import imageio_ffmpeg
 import numpy as np
 
 from common import Cancelled, UserError, check_cancel, is_nonverbal, language_matches
-from media import Media, clip_range, extract_audio, probe_media, probabilities_to_segments
-from providers import SiliconFlowClient, parse_translations
-from subtitles import (DEFAULT_STYLE, SubtitlePipeline, export_files, make_ass, make_srt, normalize_style, rewrite_files,
-                       wrap_subtitle)
+from media import Media, SpeechDetector, clip_range, extract_audio, probe_media, probabilities_to_segments
+from providers import (ContentError, CustomClient, SiliconFlowClient, custom_endpoint, parse_translation_payload,
+                       parse_translations)
+from subtitles import (DEFAULT_STYLE, REFUSED_LINES_LIMIT, SubtitlePipeline, export_files, make_ass, make_srt, normalize_style,
+                       rewrite_files, wrap_subtitle)
 from test_app import TEST_KEY
 
 
@@ -48,6 +53,9 @@ class CountingClient:
         self.responder = lambda audio: "こんにちは。"
         self.translation_requests = []
         self.asr_options = []
+        # Decides per request whether the provider turns the text down: refuses(cues, context_before, context_after).
+        self.refuses = lambda cues, before, after: False
+        self.keys = []
     def transcribe(self, audio, filename, key, **options):
         with self.lock:
             self.asr_calls += 1
@@ -60,7 +68,10 @@ class CountingClient:
         with self.lock:
             self.translation_calls += 1
             self.translation_requests.append({"cues": [dict(c) for c in cues], "language": language, **options})
+            self.keys.append(key)
         if self.translation_failure: raise self.translation_failure
+        if self.refuses(cues, options.get("context_before", ()), options.get("context_after", ())):
+            raise ContentError("服务商 HTTP 451：prohibited content")
         return {c["id"]: "你好。" for c in cues}, {"prompt_tokens": 10, "completion_tokens": 5}, "translation-trace"
 
 
@@ -194,13 +205,145 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(self.client.translation_calls, 3)
         self.assertEqual(self.client.asr_calls, 2)
 
+    def many_lines(self, count):
+        step = 1.9 / count  # the test audio is 2 seconds long
+        self.pipeline.detector = FixedDetector([{"start": i * step, "end": i * step + step * 0.7} for i in range(count)])
+        self.options.update(source_language="ja")
+
+    def test_refused_lines_keep_the_original_and_the_rest_is_translated(self):
+        self.many_lines(45)
+        refused = {3, 4, 28}
+        self.client.refuses = lambda cues, before, after: any(c["id"] in refused for c in cues)
+        self.assertEqual(self.run_pipeline(), "done")
+        segments = self.updates["segments"]
+        self.assertEqual([c["id"] for c in segments], list(range(1, 46)))
+        self.assertEqual({c["id"] for c in segments if c["text"] == c["original_text"]}, refused)
+        self.assertTrue(all(c["text"] == "你好。" for c in segments if c["id"] not in refused))
+        self.assertEqual(self.updates["stats"]["untranslated"], 3)
+        self.assertIn("有 3 句没有翻译成功", self.updates["warning"])
+        self.assertIn("HTTP 451", self.updates["warning"])
+        self.assertIn("3 句未翻译", self.updates["stage"])
+        files = {f["kind"]: Path(f["path"]).read_text(encoding="utf-8-sig") for f in self.updates["saved_files"]}
+        self.assertEqual(json.loads(files["json"])["untranslated_ids"], [3, 4, 28])
+        # An untranslated line is not printed twice in the bilingual files.
+        self.assertEqual(files["bilingual"].count("こんにちは。"), 45)
+        self.assertEqual(files["bilingual_ass"].count("こんにちは。"), 45)
+        # The parts that were refused go without neighbour context; nothing that worked is asked again on a rerun.
+        self.assertTrue(all(not r["context_before"] and not r["context_after"] for r in self.client.translation_requests if len(r["cues"]) < 5))
+        first = self.client.translation_calls
+        self.assertLess(first, 30)
+        self.run_pipeline()
+        self.assertLess(self.client.translation_calls - first, 15)
+        self.assertEqual(self.updates["stats"]["untranslated"], 3)
+
+    def test_a_line_refused_only_for_its_context_is_translated_alone(self):
+        self.many_lines(21)
+        self.client.refuses = lambda cues, before, after: len(cues) == 1 and bool(before)
+        self.assertEqual(self.run_pipeline(), "done")
+        self.assertEqual(self.updates["stats"]["untranslated"], 0)
+        self.assertEqual(self.updates["segments"][-1]["text"], "你好。")
+        self.assertNotIn("没有翻译成功", self.updates.get("warning", ""))
+
+    def test_a_service_that_refuses_everything_is_given_up_on(self):
+        self.many_lines(120)
+        self.client.refuses = lambda cues, before, after: True
+        with self.assertRaises(UserError) as raised:
+            self.run_pipeline()
+        self.assertIn("拒绝了大部分内容", str(raised.exception))
+        # About one batch taken apart line by line on each of the three workers, not all 120 lines.
+        self.assertLessEqual(self.client.translation_calls, 4 * REFUSED_LINES_LIMIT)
+        self.assertEqual(len(self.updates["original_segments"]), 120)
+
+    def test_many_refused_lines_do_not_stop_a_service_that_translates_the_rest(self):
+        self.many_lines(120)
+        refused = set(range(1, 121, 3))
+        self.client.refuses = lambda cues, before, after: any(c["id"] in refused for c in cues)
+        self.assertEqual(self.run_pipeline(), "done")
+        self.assertEqual(self.updates["stats"]["untranslated"], 40)
+        # A rerun finds the translated lines in the cache and asks only for the refused ones again.
+        first = self.client.translation_calls
+        self.assertEqual(self.run_pipeline(), "done")
+        self.assertEqual(self.updates["stats"]["untranslated"], 40)
+        self.assertLess(self.client.translation_calls - first, first)
+
+    def test_custom_api_gets_only_its_own_key_and_its_own_cache(self):
+        made, formats = [], []
+        def factory(endpoint, api_format="chat"):
+            made.append(endpoint)
+            formats.append(api_format)
+            return self.client
+        self.pipeline.custom_factory = factory
+        self.options.update(translation_provider="custom", translation_model="my-model",
+                            translation_endpoint="https://llm.example/v1/chat/completions")
+        keys = {"siliconflow": TEST_KEY, "custom": "custom-key"}
+        self.assertEqual(self.pipeline.run(self.media, self.options, keys, self.update, Event()), "done")
+        self.assertEqual((made, self.client.keys), (["https://llm.example/v1/chat/completions"], ["custom-key"]))
+        self.assertEqual(self.client.translation_requests[0]["model"], "my-model")
+        metadata = json.loads(next(Path(f["path"]) for f in self.updates["saved_files"] if f["kind"] == "json").read_text(encoding="utf-8"))
+        self.assertEqual((metadata["translation_provider"], metadata["translation_endpoint"]), ("custom", "https://llm.example/v1/chat/completions"))
+        # Without a saved custom key nothing is sent as a key, whatever other keys the job has.
+        self.options["translation_endpoint"] = "http://localhost:11434/v1/chat/completions"
+        self.pipeline.run(self.media, self.options, {"siliconflow": TEST_KEY}, self.update, Event())
+        self.pipeline.run(self.media, self.options, TEST_KEY, self.update, Event())
+        self.assertEqual(self.client.keys, ["custom-key", ""])
+        self.assertEqual(self.client.translation_calls, 2)
+        # The format the user chose goes to the client; the other endpoint has its own cache.
+        self.options.update(translation_endpoint="https://llm.example/v1/responses", translation_format="responses")
+        self.pipeline.run(self.media, self.options, keys, self.update, Event())
+        self.assertEqual((formats[0], formats[-1], made[-1], self.client.translation_calls), ("chat", "responses", "https://llm.example/v1/responses", 3))
+
+    def test_local_model_loads_while_the_audio_is_prepared(self):
+        events, release = [], Event()
+        class SlowEngine:
+            batch_size = 4
+            def start(self, cancel, progress):
+                events.append("load started")
+                progress("正在加载模型")
+                try:
+                    while not release.wait(0.01):
+                        check_cancel(cancel)
+                except Cancelled:
+                    events.append("load stopped")
+                    raise
+                events.append("load finished")
+            def transcribe_batch(self, audios, language, cancel):
+                events.append("recognise")
+                return ["本地の声。"] * len(audios)
+            def close(self):
+                events.append("closed")
+        class Detector(FixedDetector):
+            def detect(self, path, progress, cancel):
+                for _ in range(200):
+                    if events: break
+                    time.sleep(0.01)
+                events.append("speech detected")
+                release.set()
+                return super().detect(path, progress, cancel)
+        self.pipeline.local_factory = lambda folder: SlowEngine()
+        self.pipeline.detector = Detector()
+        self.options.update(asr_engine="local-1.7b", source_language="ja", target_language="original")
+        self.assertEqual(self.pipeline.run(self.media, self.options, {}, self.update, Event()), "done")
+        self.assertEqual(events[:2], ["load started", "speech detected"])
+        self.assertEqual((events.index("load finished") < events.index("recognise"), events[-1]), (True, "closed"))
+        # A job that ends before recognition stops the loading instead of leaving the model on the card.
+        events.clear()
+        release.clear()
+        def failing(media, output, start, duration, progress, cancel):
+            for _ in range(200):
+                if events: break
+                time.sleep(0.01)
+            raise UserError("提取失败")
+        self.pipeline.extractor = failing
+        with self.assertRaises(UserError) as raised:
+            self.pipeline.run(self.media, self.options, {}, self.update, Event())
+        self.assertEqual((str(raised.exception), events), ("提取失败", ["load started", "load stopped", "closed"]))
+
     def test_translation_prompt_includes_hint_and_homophone_rule(self):
         class Reply:
             headers = {}
             def __enter__(self): return self
             def __exit__(self, *args): pass
             def read(self, limit): return json.dumps({"choices": [{"finish_reason": "stop", "message": {"content": '{"translations":[{"id":1,"text":"你好"}]}'}}]}).encode()
-        from unittest.mock import patch
         with patch("providers.urllib.request.build_opener") as build:
             build.return_value.open.return_value = Reply()
             mapping, _, _ = SiliconFlowClient().translate([{"id": 1, "text": "こんにちは"}], "zh-CN", TEST_KEY, source_language="ja",
@@ -401,6 +544,42 @@ class TimingAndTranslationTests(unittest.TestCase):
         for content in ('{"translations":[]}', '{"translations":[{"id":1,"text":"甲"},{"id":1,"text":"乙"}]}', '{"translations":[{"id":true,"text":"甲"},{"id":2,"text":"乙"}]}', 'not json'):
             with self.assertRaises(UserError): parse_translations(content, [1, 2])
 
+    def test_answers_wrapped_in_thoughts_or_prose_are_still_read(self):
+        answer = '{"translations":[{"id":1,"text":"甲"}]}'
+        for content in (answer, f"<think>先想一想 {{}} </think>\n{answer}", f"```json\n{answer}\n```", f"好的，结果如下：\n{answer}\n希望有帮助。"):
+            self.assertEqual(parse_translations(content, [1]), {1: "甲"}, content)
+        for content in ("", "```", "没有 JSON", None, '{"translations":[{"id":1,"text":"  "}]}'):
+            with self.assertRaises(ContentError): parse_translations(content, [1])
+        reply = lambda reason: {"choices": [{"finish_reason": reason, "message": {"content": answer}}]}
+        # Built-in providers must say "stop"; a custom server may name a normal end differently, but never a cut answer.
+        self.assertEqual(parse_translation_payload(reply("stop"), [1]), {1: "甲"})
+        self.assertEqual(parse_translation_payload(reply("eos"), [1], None), {1: "甲"})
+        for reason, allowed in (("eos", (None, "stop")), ("length", None), ("content_filter", None)):
+            with self.assertRaises(ContentError): parse_translation_payload(reply(reason), [1], allowed)
+        with self.assertRaises(UserError): parse_translation_payload({"choices": ["x"]}, [1], None)
+
+    def test_custom_endpoint_accepts_base_urls_and_full_addresses(self):
+        for given, expected in (("https://api.deepseek.com/v1", "https://api.deepseek.com/v1/chat/completions"),
+                                (" https://api.deepseek.com/v1/ ", "https://api.deepseek.com/v1/chat/completions"),
+                                ("https://api.deepseek.com", "https://api.deepseek.com/v1/chat/completions"),
+                                ("http://localhost:11434/v1/chat/completions", "http://localhost:11434/v1/chat/completions"),
+                                ("https://x.example/openai/chat/completions?api-version=1", "https://x.example/openai/chat/completions?api-version=1")):
+            self.assertEqual(custom_endpoint(given), expected)
+        # Each format has its own path; a bare host gets /v1, an address copied for another format is switched over.
+        for given, api_format, expected in (("https://gw.example/v1", "responses", "https://gw.example/v1/responses"),
+                                            ("https://gw.example/v1/", "messages", "https://gw.example/v1/messages"),
+                                            ("https://api.anthropic.com", "messages", "https://api.anthropic.com/v1/messages"),
+                                            ("https://gw.example/v1/chat/completions", "responses", "https://gw.example/v1/responses"),
+                                            ("https://gw.example/v1/responses", "chat", "https://gw.example/v1/chat/completions"),
+                                            ("https://gw.example/api/messages", "messages", "https://gw.example/api/messages")):
+            self.assertEqual(custom_endpoint(given, api_format), expected)
+        for bad in ("soap", None, ["chat"]):
+            with self.assertRaises(UserError): custom_endpoint("https://gw.example/v1", bad)
+        with self.assertRaises(UserError): custom_endpoint("https://gw.example/v1/chat/completions?a=1", "responses")
+        for bad in ("", None, "api.deepseek.com/v1", "file:///etc/passwd", "https://", "https://a b.example/v1", "https://中文.example/v1",
+                    "https://key@x.example/v1", "https://x.example/v1#part", "https://x.example/v1?a=1", "https://x.example:99999/v1", "x" * 600):
+            with self.assertRaises(UserError): custom_endpoint(bad)
+
     def test_file_paths_and_clip_ranges_are_validated(self):
         with self.assertRaises(UserError): probe_media("https://example.com/movie.mp4")
         with self.assertRaises(UserError): probe_media(r"\\server\share\movie.mp4")
@@ -408,6 +587,280 @@ class TimingAndTranslationTests(unittest.TestCase):
         self.assertEqual(clip_range(media, 90, 30), (90, 10))
         for start, duration in ((-1, 2), (100, 1), (0, float("nan")), (float("inf"), 1)):
             with self.assertRaises(UserError): clip_range(media, start, duration)
+
+
+class Reply:
+    def __init__(self, payload, headers=None): self.payload, self.headers = payload, headers or {}
+    def __enter__(self): return self
+    def __exit__(self, *args): pass
+    def read(self, limit): return json.dumps(self.payload).encode()
+
+
+class Stream(Reply):
+    """A server-sent event stream made of the given events."""
+    def __init__(self, events): super().__init__(events, {"Content-Type": "text/event-stream; charset=utf-8"})
+    def read(self, limit):
+        return "".join(f"event: {e.get('type')}\ndata: {json.dumps(e, ensure_ascii=False)}\n\n" for e in self.payload).encode() + b"data: [DONE]\n\n"
+
+
+def http_error(code, message):
+    return urllib.error.HTTPError("https://llm.example", code, "error", {}, BytesIO(json.dumps({"error": {"message": message}}).encode()))
+
+
+class CustomClientTests(unittest.TestCase):
+    CUES = [{"id": 1, "text": "こんにちは"}]
+    ANSWER = {"choices": [{"finish_reason": "stop", "message": {"content": '{"translations":[{"id":1,"text":"你好"}]}'}}], "usage": None}
+
+    def call(self, replies, key="custom-key", client=None, endpoint="https://llm.example/v1/chat/completions", api_format="chat"):
+        client = client or CustomClient(endpoint, api_format=api_format)
+        with patch("providers.urllib.request.build_opener") as build:
+            build.return_value.open.side_effect = replies
+            try:
+                result = client.translate(self.CUES, "zh-CN", key, source_language="ja", model="my-model", context_hint="访谈")
+            except Exception as exc:
+                result = exc
+            sent = [call.args[0] for call in build.return_value.open.call_args_list]
+            handlers = [type(h).__name__ for h in build.call_args.args]
+        return result, sent, handlers, client
+
+    def test_request_goes_to_the_given_address_with_standard_parameters(self):
+        (mapping, usage, _), sent, handlers, _ = self.call([Reply(self.ANSWER)])
+        self.assertEqual((mapping, usage), ({1: "你好"}, {}))
+        self.assertEqual((sent[0].full_url, sent[0].get_header("Authorization")), ("https://llm.example/v1/chat/completions", "Bearer custom-key"))
+        body = json.loads(sent[0].data)
+        self.assertEqual({k: v for k, v in body.items() if k != "messages"},
+                         {"model": "my-model", "stream": False, "temperature": 0.1, "response_format": {"type": "json_object"}})
+        self.assertIn("访谈", body["messages"][0]["content"])
+        # Redirects are never followed with the key; a public address may use the system proxy.
+        self.assertEqual(handlers, ["NoRedirect"])
+
+    def test_no_key_means_no_authorization_header_and_local_servers_skip_the_proxy(self):
+        (mapping, _, _), sent, handlers, _ = self.call([Reply(self.ANSWER)], key="", endpoint="http://localhost:11434/v1/chat/completions")
+        self.assertEqual(mapping, {1: "你好"})
+        self.assertIsNone(sent[0].get_header("Authorization"))
+        self.assertEqual(handlers, ["NoRedirect", "ProxyHandler"])
+
+    def test_optional_parameters_are_dropped_once_a_server_turns_them_down(self):
+        (mapping, _, _), sent, _, client = self.call([http_error(400, "response_format is not supported"), Reply(self.ANSWER)])
+        self.assertEqual((mapping, len(sent), client.plain), ({1: "你好"}, 2, True))
+        self.assertEqual(set(json.loads(sent[1].data)), {"model", "stream", "messages"})
+        _, sent, _, _ = self.call([Reply(self.ANSWER)], client=client)
+        self.assertEqual((len(sent), set(json.loads(sent[0].data))), (1, {"model", "stream", "messages"}))
+
+    def test_errors_that_are_not_about_parameters_are_not_sent_again(self):
+        for code, expected in ((401, "请更新 API Key"), (404, "/v1"), (429, "稍后"), (500, "HTTP 500"), (301, "最终地址")):
+            error, sent, _, client = self.call([http_error(code, "nope custom-key")])
+            self.assertIsInstance(error, UserError)
+            self.assertNotIsInstance(error, ContentError)
+            self.assertIn(expected, str(error))
+            self.assertNotIn("custom-key", str(error))
+            self.assertEqual((len(sent), client.plain), (1, False))
+        refused, sent, _, _ = self.call([http_error(451, "prohibited or sensitive content")])
+        self.assertIsInstance(refused, ContentError)
+        flagged, sent, _, _ = self.call([http_error(400, "Content Exists Risk")])
+        self.assertEqual((type(flagged), len(sent)), (ContentError, 1))
+        both, sent, _, client = self.call([http_error(400, "bad request"), http_error(400, "model not found")])
+        self.assertIn("model not found", str(both))
+        self.assertEqual((len(sent), client.plain), (2, False))
+        with self.assertRaises(UserError):
+            CustomClient("file:///C:/secret")
+        with self.assertRaises(UserError):
+            CustomClient("https://llm.example/v1/chat/completions", api_format="soap")
+
+    JSON_TEXT = '{"translations":[{"id":1,"text":"你好"}]}'
+
+    def responses(self, replies, **options):
+        return self.call(replies, endpoint="https://gw.example/v1/responses", api_format="responses", **options)
+
+    def completed(self, status="completed", content=None, **more):
+        content = [{"type": "output_text", "text": self.JSON_TEXT}] if content is None else content
+        return {"id": "resp_1", "status": status, "error": None, "usage": {"input_tokens": 30, "output_tokens": 7, "total_tokens": 37},
+                "output": [{"type": "reasoning", "summary": []}, {"type": "message", "role": "assistant", "content": content}], **more}
+
+    def test_responses_format_streams_and_reads_the_final_answer(self):
+        events = [{"type": "response.created", "response": {"status": "in_progress"}},
+                  {"type": "response.output_text.delta", "delta": self.JSON_TEXT[:10]},
+                  {"type": "response.output_text.delta", "delta": self.JSON_TEXT[10:]},
+                  {"type": "response.completed", "response": self.completed()}]
+        (mapping, usage, _), sent, _, _ = self.responses([Stream(events)])
+        self.assertEqual((mapping, usage), ({1: "你好"}, {"prompt_tokens": 30, "completion_tokens": 7}))
+        self.assertEqual((sent[0].full_url, sent[0].get_header("Authorization"), sent[0].get_header("X-api-key")),
+                         ("https://gw.example/v1/responses", "Bearer custom-key", None))
+        body = json.loads(sent[0].data)
+        self.assertEqual({k: v for k, v in body.items() if k not in {"instructions", "input"}},
+                         {"model": "my-model", "stream": True, "store": False, "text": {"format": {"type": "json_object"}}})
+        self.assertIn("访谈", body["instructions"])
+        text = body["input"][0]["content"][0]
+        self.assertEqual((body["input"][0]["role"], text["type"]), ("user", "input_text"))
+        # JSON mode is only accepted when the input itself says JSON.
+        self.assertIn("JSON", text["text"])
+        self.assertIn("こんにちは", text["text"])
+        # A server that answers in one piece, or whose final event carries no output, is read as well.
+        (mapping, _, _), _, _, _ = self.responses([Reply(self.completed())])
+        self.assertEqual(mapping, {1: "你好"})
+        (mapping, _, _), _, _, _ = self.responses([Stream([events[1], events[2], {"type": "response.completed", "response": {"status": "completed", "output": []}}])])
+        self.assertEqual(mapping, {1: "你好"})
+
+    def test_responses_format_drops_json_mode_when_it_is_turned_down(self):
+        done = Stream([{"type": "response.completed", "response": self.completed()}])
+        (mapping, _, _), sent, _, client = self.responses([http_error(400, "Unsupported parameter: text.format"), done])
+        self.assertEqual((mapping, len(sent), client.plain), ({1: "你好"}, 2, True))
+        self.assertEqual(set(json.loads(sent[1].data)), {"model", "instructions", "input", "stream", "store"})
+
+    def test_responses_format_never_takes_part_of_an_answer(self):
+        delta = {"type": "response.output_text.delta", "delta": self.JSON_TEXT}
+        cut, sent, _, _ = self.responses([Stream([delta])])
+        # The connection ended before the answer did: maybe billed, so it is not sent again by itself.
+        self.assertEqual((type(cut), len(sent)), (UserError, 1))
+        self.assertIn("没有传完", str(cut))
+        for events in ([delta, {"type": "response.incomplete", "response": self.completed("incomplete", incomplete_details={"reason": "max_output_tokens"})}],
+                       [{"type": "response.completed", "response": self.completed(content=[{"type": "refusal", "refusal": "no"}])}],
+                       [{"type": "response.completed", "response": self.completed(content=[])}],
+                       [{"type": "response.failed", "response": {"status": "failed", "error": {"code": "x", "message": "flagged by content policy"}}}]):
+            self.assertIsInstance(self.responses([Stream(events)])[0], ContentError, events)
+        for events in ([{"type": "response.failed", "response": {"status": "failed", "error": {"code": "server_error", "message": "upstream broke custom-key"}}}],
+                       [delta, {"type": "error", "code": "rate_limit_exceeded", "message": "slow down"}],
+                       [{"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}]):
+            failed = self.responses([Stream(events)])[0]
+            self.assertEqual((type(failed), "custom-key" in str(failed)), (UserError, False), events)
+
+    MESSAGE = {"type": "message", "role": "assistant", "stop_reason": "end_turn", "usage": {"input_tokens": 12, "output_tokens": 5},
+               "content": [{"type": "thinking", "thinking": "…"}, {"type": "text", "text": JSON_TEXT}]}
+
+    def messages(self, replies, **options):
+        return self.call(replies, endpoint="https://gw.example/v1/messages", api_format="messages", **options)
+
+    def test_messages_format_speaks_anthropic(self):
+        (mapping, usage, _), sent, _, _ = self.messages([Reply(self.MESSAGE)])
+        self.assertEqual((mapping, usage), ({1: "你好"}, {"prompt_tokens": 12, "completion_tokens": 5}))
+        self.assertEqual((sent[0].full_url, sent[0].get_header("X-api-key"), sent[0].get_header("Anthropic-version"), sent[0].get_header("Authorization")),
+                         ("https://gw.example/v1/messages", "custom-key", "2023-06-01", None))
+        body = json.loads(sent[0].data)
+        self.assertEqual({k: v for k, v in body.items() if k not in {"system", "messages"}}, {"model": "my-model", "max_tokens": 8192, "temperature": 0.1})
+        self.assertIn("访谈", body["system"])
+        self.assertEqual((len(body["messages"]), body["messages"][0]["role"]), (1, "user"))
+        for reason in ("max_tokens", "refusal"):
+            self.assertIsInstance(self.messages([Reply({**self.MESSAGE, "stop_reason": reason})])[0], ContentError)
+        self.assertIsInstance(self.messages([Reply({**self.MESSAGE, "content": []})])[0], ContentError)
+        wrong = self.messages([Reply(self.ANSWER)])[0]
+        self.assertEqual((type(wrong), "格式错误" in str(wrong)), (UserError, True))
+        # Without the optional parameters after a 400, as in the other formats.
+        (mapping, _, _), sent, _, client = self.messages([http_error(400, "temperature is not supported"), Reply(self.MESSAGE)])
+        self.assertEqual((mapping, client.plain, json.loads(sent[1].data).get("temperature"), json.loads(sent[1].data)["max_tokens"]),
+                         ({1: "你好"}, True, None, 4096))
+
+    def test_messages_format_falls_back_to_a_bearer_key_after_401(self):
+        (mapping, _, _), sent, _, client = self.messages([http_error(401, "missing bearer token"), Reply(self.MESSAGE)])
+        self.assertEqual((mapping, len(sent), client.auth), ({1: "你好"}, 2, "bearer"))
+        self.assertEqual((sent[1].get_header("Authorization"), sent[1].get_header("X-api-key"), sent[1].get_header("Anthropic-version")),
+                         ("Bearer custom-key", None, "2023-06-01"))
+        _, sent, _, _ = self.call([Reply(self.MESSAGE)], client=client)
+        self.assertEqual((len(sent), sent[0].get_header("Authorization")), (1, "Bearer custom-key"))
+        # A key that is simply wrong is reported after both forms were tried; without a key there is nothing to try.
+        wrong, sent, _, _ = self.messages([http_error(401, "invalid key"), http_error(401, "invalid key")])
+        self.assertEqual((type(wrong).__name__, len(sent), "请更新 API Key" in str(wrong)), ("ProviderError", 2, True))
+        _, sent, _, _ = self.messages([http_error(401, "key needed")], key="")
+        self.assertEqual(len(sent), 1)
+
+    def test_error_naming_another_endpoint_points_at_the_format_setting(self):
+        gateway = "/v1/chat/completions serves the DeepSeek models only; use /v1/messages for Claude models and /v1/responses for GPT models"
+        error, sent, _, _ = self.call([http_error(400, gateway), http_error(400, gateway)])
+        self.assertEqual(len(sent), 2)
+        # The model of the test (my-model) belongs to neither family named, so both formats are suggested.
+        self.assertIn("请把“接口格式”改为 Responses 或 Anthropic Messages", str(error))
+        self.assertIn("use /v1/messages", str(error))
+        for model, expected in (("gpt-6.1-sol", "改为 Responses 后"), ("claude-sonnet-5-5", "改为 Anthropic Messages 后")):
+            client = CustomClient("https://gw.example/v1/chat/completions")
+            with patch("providers.urllib.request.build_opener") as build:
+                build.return_value.open.side_effect = [http_error(400, gateway), http_error(400, gateway)]
+                with self.assertRaises(UserError) as raised:
+                    client.translate(self.CUES, "zh-CN", "custom-key", model=model)
+            self.assertIn(expected, str(raised.exception))
+        # An address that does not exist on the server may be the wrong format, too.
+        missing = self.responses([http_error(404, "Not Found")])[0]
+        self.assertIn("接口格式", str(missing))
+        plain = self.call([http_error(404, "model not found")])[0]
+        self.assertIn("接口格式", str(plain))
+        self.assertNotIn("接口格式", str(self.call([http_error(429, "slow down")])[0]))
+
+
+class SpeechDetectorTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        self.wav = Path(self.temp.name) / "speech.wav"
+        rng = np.random.default_rng(7)
+        # 20.02 s (not a whole number of frames): noise bursts between silences.
+        count = 16000 * 20 + 300
+        envelope = (np.sin(np.arange(count) / 16000 * 1.3) > 0.2).astype(np.float32)
+        samples = (rng.standard_normal(count) * 6000 * envelope).astype("<i2")
+        with wave.open(str(self.wav), "wb") as target:
+            target.setnchannels(1)
+            target.setsampwidth(2)
+            target.setframerate(16000)
+            target.writeframes(samples.tobytes())
+        self.samples = samples
+
+    def tearDown(self): self.temp.cleanup()
+
+    def reference(self):
+        """The detector as it was first written: one frame per model call, straight from the samples."""
+        import onnxruntime as ort
+        from media import VAD_PATH
+        session = ort.InferenceSession(str(VAD_PATH), providers=["CPUExecutionProvider"])
+        state, context, probabilities = np.zeros((2, 1, 128), dtype=np.float32), np.zeros((1, 64), dtype=np.float32), []
+        for first in range(0, len(self.samples), 512):
+            frame = self.samples[first:first + 512].astype(np.float32) / 32768.0
+            frame = np.pad(frame, (0, 512 - len(frame)))
+            chunk = np.concatenate((context, frame.reshape(1, -1)), axis=1)
+            output, state = session.run(None, {"input": chunk, "state": state, "sr": np.array(16000, dtype=np.int64)})
+            probabilities.append(float(output.reshape(-1)[0]))
+            context = chunk[:, -64:]
+        return probabilities
+
+    def probabilities(self, detector):
+        seen = {}
+        def capture(probabilities, duration, **options):
+            seen["probabilities"], seen["duration"] = probabilities, duration
+            return []
+        progress = []
+        with patch("media.probabilities_to_segments", capture):
+            detector.detect(self.wav, lambda ratio, label: progress.append(ratio), Event())
+        self.assertEqual(progress[-1], 1)
+        self.assertTrue(all(0 < ratio <= 1 for ratio in progress))
+        return seen["probabilities"], seen["duration"]
+
+    def test_one_stream_gives_exactly_the_frame_by_frame_result(self):
+        detector = SpeechDetector(workers=4)
+        detector.BLOCK = 7  # several blocks, the last one short
+        probabilities, duration = self.probabilities(detector)
+        self.assertEqual(probabilities, self.reference())
+        self.assertAlmostEqual(duration, 20.01875)
+
+    def test_long_files_are_split_and_each_part_replays_what_came_before(self):
+        reference = self.reference()
+        detector = SpeechDetector(workers=3)
+        detector.PART_SECONDS, detector.WARMUP_SECONDS = 5, 2
+        probabilities, _ = self.probabilities(detector)
+        size = -(-len(reference) // 3)
+        self.assertEqual(len(probabilities), len(reference))
+        # The first part starts like the single stream; later parts start from a short replay and only come close.
+        self.assertEqual(probabilities[:size], reference[:size])
+        self.assertNotEqual(probabilities, reference)
+        whole = SpeechDetector(workers=3)
+        whole.PART_SECONDS, whole.WARMUP_SECONDS = 5, 1000
+        self.assertEqual(self.probabilities(whole)[0], reference)
+        self.assertEqual(self.probabilities(SpeechDetector(workers=1))[0], reference)
+
+    def test_cancel_stops_every_part(self):
+        detector = SpeechDetector(workers=3)
+        detector.PART_SECONDS, detector.BLOCK = 5, 10
+        cancel, calls = Event(), []
+        def progress(ratio, label):
+            calls.append(ratio)
+            cancel.set()
+        with self.assertRaises(Cancelled):
+            detector.detect(self.wav, progress, cancel)
+        self.assertLess(len(calls), 12)
 
 
 FAKE_WORKER = r'''
@@ -466,6 +919,25 @@ class LocalWorkerProtocolTests(unittest.TestCase):
         with self.assertRaises(Cancelled):
             self.engine.transcribe_batch([b"x"], "hang", cancel)
         self.assertIsNone(self.engine.process)
+
+    def test_waits_for_the_graphics_card_and_releases_it(self):
+        from local_asr import GpuGate, LocalAsrEngine
+        from threading import Timer
+        gate = GpuGate()
+        gate.acquire("去马赛克", Event())
+        engine = LocalAsrEngine("Fake", python=self.engine.python, worker=self.engine.worker, models=self.engine.models,
+                                log_dir=self.engine.log_dir, gate=gate)
+        stages, cancel = [], Event()
+        Timer(0.3, cancel.set).start()
+        with self.assertRaises(Cancelled):
+            engine.start(cancel, stages.append)
+        self.assertIsNone(engine.process)
+        self.assertIn("去马赛克正在使用显卡", stages[0])
+        Timer(0.3, gate.release).start()
+        engine.start(Event(), stages.append)
+        self.assertEqual(gate.holder, "本地语音识别")
+        engine.close()
+        self.assertFalse(gate.busy())
 
     def test_missing_model_is_reported_before_starting(self):
         from local_asr import LocalAsrEngine

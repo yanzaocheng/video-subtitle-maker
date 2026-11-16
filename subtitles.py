@@ -1,7 +1,7 @@
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 import hashlib
 import json
 import math
@@ -14,11 +14,14 @@ import unicodedata
 from common import (ASR_ENGINES, PROVIDERS, Cancelled, LANGUAGES, MODEL, TRANSLATION_MODEL, UserError, check_cancel,
                     is_nonverbal, language_matches)
 from local_asr import LocalAsrEngine
-from media import SpeechDetector, extract_audio, read_wav_segment, video_size
+from media import AnyEvent, SpeechDetector, extract_audio, read_wav_segment, video_size
+from providers import ContentError, CustomClient
 
 ROOT = Path(__file__).resolve().parent
 TIME_AXIS_NOTE = "本地 Silero VAD 按停顿合并的整句时间轴（每条最长约 10 秒），不是逐字强制对齐。低声、重叠对白需试听校对。"
 TRANSLATION_BATCH = 20
+# A translation service is given up on once it has turned down this many lines and more lines than it translated.
+REFUSED_LINES_LIMIT = 20
 CLOSING_PUNCTUATION = set("。，、！？；：」』）】〉》…,.!?;:)]}")
 
 # One subtitle style drives both the editor preview and the exported .ass files.
@@ -156,7 +159,7 @@ def make_ass(segments, style=None, size=None, bilingual=False):
         if start == end or not item["text"].strip():
             continue
         text = lines(item["text"], em)
-        if bilingual and (item.get("original_text") or "").strip():
+        if bilingual and has_other_original(item):
             text += f"\\N{{\\fs{ass_number(small * cell)}\\bord{ass_number(border(small))}}}" + lines(item["original_text"], small)
         events.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}")
     header = [
@@ -183,6 +186,12 @@ def make_ass(segments, style=None, size=None, bilingual=False):
     return "\ufeff" + "\n".join(header + events) + "\n"
 
 
+def has_other_original(item):
+    """False when there is no original line, or it would repeat the text (a line that could not be translated)."""
+    original = (item.get("original_text") or "").strip()
+    return bool(original) and original != item["text"].strip()
+
+
 def make_srt(segments, bilingual=False):
     blocks, previous_end = [], 0.0
     for item in segments:
@@ -193,28 +202,34 @@ def make_srt(segments, bilingual=False):
         if rendered_start == rendered_end:
             continue
         text = wrap_subtitle(item["text"])
-        if bilingual and item.get("original_text"):
+        if bilingual and has_other_original(item):
             text += "\n" + wrap_subtitle(item["original_text"])
         blocks.append(f"{len(blocks) + 1}\n{rendered_start} --> {rendered_end}\n{text}")
         previous_end = end
     return "\n\n".join(blocks) + ("\n" if blocks else "")
 
 
+def file_suffix(kind, language):
+    """End of a subtitle file name after the video name, e.g. "zh-CN.srt"."""
+    target = language if language != "original" else "source"
+    return {"srt": f"{target}.srt", "original": "source.srt", "bilingual": f"{language}.bilingual.srt",
+            "ass": f"{target}.ass", "bilingual_ass": f"{language}.bilingual.ass", "json": "subtitles.json"}[kind]
+
+
 def subtitle_files(language, original, translated, bilingual, style=None, size=None):
     """Render a job's subtitle files: kind -> (file name suffix, content)."""
-    target = language if language != "original" else "source"
     both = bool(translated) and bilingual and language != "original"
     files = {}
     if translated:
-        files["srt"] = (f"{target}.srt", make_srt(translated))
+        files["srt"] = (file_suffix("srt", language), make_srt(translated))
     if original and language != "original":
-        files["original"] = ("source.srt", make_srt(original))
+        files["original"] = (file_suffix("original", language), make_srt(original))
     if both:
-        files["bilingual"] = (f"{language}.bilingual.srt", make_srt(translated, bilingual=True))
+        files["bilingual"] = (file_suffix("bilingual", language), make_srt(translated, bilingual=True))
     if translated:
-        files["ass"] = (f"{target}.ass", make_ass(translated, style, size))
+        files["ass"] = (file_suffix("ass", language), make_ass(translated, style, size))
     if both:
-        files["bilingual_ass"] = (f"{language}.bilingual.ass", make_ass(translated, style, size, bilingual=True))
+        files["bilingual_ass"] = (file_suffix("bilingual_ass", language), make_ass(translated, style, size, bilingual=True))
     return files
 
 
@@ -296,7 +311,7 @@ def export_files(media, language, original, translated, bilingual, output_direct
     candidates = [(kind, suffix, content) for kind, (suffix, content) in files.items()]
     if not candidates:
         return []
-    candidates.append(("json", "subtitles.json", json.dumps(metadata, ensure_ascii=False, indent=2)))
+    candidates.append(("json", file_suffix("json", language), json.dumps(metadata, ensure_ascii=False, indent=2)))
     # A unique family name avoids replacing pre-existing subtitles or a previous run.
     if any((directory / f"{stem}.{suffix}").exists() for _, suffix, _ in candidates):
         stem += "." + stamp
@@ -317,7 +332,7 @@ def key_for(keys, provider):
 
 
 class CloudAsr:
-    parallel, batch_size, uploads = 4, 1, True
+    parallel, batch_size, uploads, preload = 4, 1, True, False
 
     def __init__(self, client, provider, model, api_key, language):
         self.client, self.provider, self.api_key, self.language = client, provider, api_key, language
@@ -339,7 +354,8 @@ class CloudAsr:
 
 
 class LocalAsr:
-    parallel, uploads = 1, False
+    # Loading the model takes a while, so it starts while the audio is still being extracted and analysed.
+    parallel, uploads, preload = 1, False, True
 
     def __init__(self, engine, folder, language):
         self.engine, self.language = engine, language
@@ -359,8 +375,64 @@ class LocalAsr:
         self.engine.close()
 
 
+class Warmup:
+    """Starts a recognition engine in the background while the job is busy with other steps."""
+
+    def __init__(self, asr, cancel):
+        self.asr, self.cancel, self.abort = asr, cancel, Event()
+        self.label, self.listener, self.error, self.thread = "", None, None, None
+        if asr.preload:
+            self.thread = Thread(target=self._run, name="subtitle-asr-warmup", daemon=True)
+            self.thread.start()
+
+    def _progress(self, label):
+        self.label = label
+        if self.listener is not None:
+            self.listener(label)
+
+    def _run(self):
+        try:
+            # The start also gives up when the job ends early for another reason than the user's cancel.
+            self.asr.start(AnyEvent(self.cancel, self.abort), self._progress)
+        except BaseException as exc:
+            self.error = exc
+
+    def wait(self, progress):
+        """Return once the engine is ready, raising what its start raised."""
+        if self.thread is None:
+            self.asr.start(self.cancel, progress)
+            return
+        self.listener = progress
+        if self.thread.is_alive() and self.label:
+            progress(self.label)
+        self.thread.join()
+        if self.error is not None:
+            check_cancel(self.cancel)
+            raise self.error
+
+    def stop(self):
+        self.abort.set()
+        if self.thread is not None:
+            self.thread.join()
+
+
+class Translator:
+    """Where a job's subtitles are translated, and under which name the results are cached."""
+
+    def __init__(self, client, provider, model, api_key, endpoint=""):
+        self.client, self.model, self.api_key = client, model, api_key
+        # SiliconFlow keeps its original cache namespace so earlier results are reused.
+        if provider == "siliconflow":
+            self.namespace = f"translation:v2:{model}"
+        elif provider == "custom":
+            self.namespace = f"translation:v2:custom:{endpoint}:{model}"
+        else:
+            self.namespace = f"translation:v2:{provider}:{model}"
+
+
 class SubtitlePipeline:
-    def __init__(self, clients, cache_dir=None, work_dir=None, detector=None, extractor=None, local_factory=None):
+    def __init__(self, clients, cache_dir=None, work_dir=None, detector=None, extractor=None, local_factory=None,
+                 custom_factory=CustomClient):
         # A single client object serves every cloud provider (used by tests).
         self.clients = clients if isinstance(clients, dict) else {provider: clients for provider in PROVIDERS}
         self.cache = ResultCache(cache_dir or ROOT / "cache")
@@ -369,6 +441,8 @@ class SubtitlePipeline:
         self.detector = detector if detector is not None else SpeechDetector()
         self.extractor = extractor if extractor is not None else extract_audio
         self.local_factory = local_factory or (lambda folder: LocalAsrEngine(folder, batch_size=16 if "0.6B" in folder else 8))
+        # Builds the client for a user-supplied translation API from its address and the format it speaks.
+        self.custom_factory = custom_factory
 
     def make_asr(self, options, keys):
         engine = ASR_ENGINES[options.get("asr_engine", "siliconflow")]
@@ -379,45 +453,86 @@ class SubtitlePipeline:
         return CloudAsr(self.clients[engine["provider"]], engine["provider"], engine["model"],
                         key_for(keys, engine["provider"]), language)
 
-    def translate_all(self, originals, language, source_language, model, api_key, update, cancel, stats, traces,
-                      context_hint="", provider="siliconflow"):
-        client = self.clients[provider]
-        prefix = f"translation:v2:{model}" if provider == "siliconflow" else f"translation:v2:{provider}:{model}"
-        batches = [originals[i:i + TRANSLATION_BATCH] for i in range(0, len(originals), TRANSLATION_BATCH)]
-        lock, halt, results = Lock(), Event(), {}
+    def make_translator(self, options, keys):
+        provider = options.get("translation_provider", "siliconflow")
+        model = options.get("translation_model", TRANSLATION_MODEL)
+        if provider == "custom":
+            endpoint = options.get("translation_endpoint", "")
+            # Only the key saved for the custom API goes to it, and it is optional (local model servers need none).
+            key = (keys.get("custom") or "") if isinstance(keys, dict) else ""
+            client = self.custom_factory(endpoint, api_format=options.get("translation_format") or "chat")
+            return Translator(client, provider, model, key, endpoint)
+        return Translator(self.clients[provider], provider, model, key_for(keys, provider))
 
-        def translate_batch(number):
+    def translate_all(self, originals, language, source_language, translator, update, cancel, stats, traces,
+                      context_hint=""):
+        """Translate every cue; returns (cues, {id: reason} of the lines that keep their original text).
+
+        A refusal or an unusable answer only concerns the text of that request, so those lines are sent again in
+        smaller parts instead of failing the whole job; what still fails as a single line is left untranslated."""
+        batches = [originals[i:i + TRANSLATION_BATCH] for i in range(0, len(originals), TRANSLATION_BATCH)]
+        lock, halt, results, failed, translated = Lock(), Event(), {}, {}, [0]
+
+        def request(cues, before, after):
             check_cancel(cancel)
             if halt.is_set():
                 raise Cancelled("前序翻译失败，已停止后续提交。")
-            first, batch = number * TRANSLATION_BATCH, batches[number]
-            # Neighbouring lines give the translator context without being translated twice.
-            before = [c["text"] for c in originals[max(0, first - 6):first]]
-            after = [c["text"] for c in originals[first + len(batch):first + len(batch) + 3]]
-            request = {"subtitles": [{"id": c["id"], "text": c["text"]} for c in batch], "before": before,
+            content = {"subtitles": [{"id": c["id"], "text": c["text"]} for c in cues], "before": before,
                        "after": after, "hint": context_hint}
-            cache_key = self.cache.key(f"{prefix}:{source_language}:{language}", request)
+            cache_key = self.cache.key(f"{translator.namespace}:{source_language}:{language}", content)
             cached = self.cache.get(cache_key)
-            if isinstance(cached, dict) and all(isinstance(cached.get(str(c["id"])), str) and cached[str(c["id"])].strip() for c in batch):
+            if isinstance(cached, dict) and all(isinstance(cached.get(str(c["id"])), str) and cached[str(c["id"])].strip() for c in cues):
                 with lock:
                     stats["translation_cached"] += 1
-                return number, {c["id"]: cached[str(c["id"])] for c in batch}
-            check_cancel(cancel)
-            if halt.is_set():
-                raise Cancelled("已停止后续提交。")
+                    translated[0] += len(cues)
+                return {c["id"]: cached[str(c["id"])] for c in cues}
             with lock:
                 stats["translation_requests"] += 1
-            mapping, usage, trace = client.translate(batch, language, api_key, source_language=source_language,
-                                                     model=model, context_before=before, context_after=after,
-                                                     context_hint=context_hint)
+            mapping, usage, trace = translator.client.translate(
+                cues, language, translator.api_key, source_language=source_language, model=translator.model,
+                context_before=before, context_after=after, context_hint=context_hint)
             self.cache.put(cache_key, {str(k): v for k, v in mapping.items()})
             with lock:
+                translated[0] += len(cues)
                 for field in ("prompt_tokens", "completion_tokens"):
                     if isinstance(usage.get(field), int):
                         stats[field] += usage[field]
                 if trace:
                     traces.append(trace)
-            return number, mapping
+            return mapping
+
+        def give_up(cue, error):
+            with lock:
+                failed[cue["id"]] = str(error)
+                if len(failed) >= REFUSED_LINES_LIMIT and len(failed) > translated[0]:
+                    raise UserError(f"翻译服务拒绝了大部分内容或返回了无法使用的结果（已有 {len(failed)} 句失败），已停止翻译。"
+                                    f"最后一次：{error} 请换一个翻译模型（例如“自定义 API”）后重新生成，"
+                                    "已识别的语音和已翻译的部分会复用缓存。")
+            return {}
+
+        def without_context(cues):
+            try:
+                return request(cues, [], [])
+            except ContentError as exc:
+                if len(cues) == 1:
+                    return give_up(cues[0], exc)
+                middle = (len(cues) + 1) // 2
+                return {**without_context(cues[:middle]), **without_context(cues[middle:])}
+
+        def translate_batch(number):
+            first, batch = number * TRANSLATION_BATCH, batches[number]
+            # Neighbouring lines give the translator context without being translated twice.
+            before = [c["text"] for c in originals[max(0, first - 6):first]]
+            after = [c["text"] for c in originals[first + len(batch):first + len(batch) + 3]]
+            try:
+                return number, request(batch, before, after)
+            except ContentError as exc:
+                if len(batch) == 1 and not before and not after:
+                    return number, give_up(batch[0], exc)
+                # The neighbouring lines may be what was refused, so the parts go without them.
+                middle = (len(batch) + 1) // 2
+                parts = [batch] if len(batch) == 1 else [batch[:middle], batch[middle:]]
+                return number, {ident: text for part in parts for ident, text in without_context(part).items()}
 
         def guarded(number):
             try:
@@ -425,6 +540,11 @@ class SubtitlePipeline:
             except Exception:
                 halt.set()
                 raise
+
+        def merged(numbers):
+            # A line without a translation keeps its original text, so the timeline stays complete.
+            return [{**cue, "text": results[n].get(cue["id"], cue["text"]), "original_text": cue["text"]}
+                    for n in numbers for cue in batches[n]]
 
         first_error = None
         update(stage=f"正在翻译为{LANGUAGES[language]}：共 {len(batches)} 批", stats=dict(stats))
@@ -442,92 +562,91 @@ class SubtitlePipeline:
                     halt.set()
                     for pending in futures:
                         pending.cancel()
-                partial = sorted(({**cue, "text": results[n][cue["id"]], "original_text": cue["text"]}
-                                  for n in results for cue in batches[n]), key=lambda c: c["start"])
+                partial = sorted(merged(results), key=lambda c: c["start"])
                 with lock:
+                    stats["untranslated"] = len(failed)
                     snapshot = dict(stats)
                 update(stage=f"字幕翻译：{len(partial)} / {len(originals)} 句", segments=partial, stats=snapshot,
                        progress=round(80 + len(results) / len(batches) * 17, 1))
         check_cancel(cancel)
         if first_error is not None:
             raise first_error
-        return [{**cue, "text": results[n][cue["id"]], "original_text": cue["text"]}
-                for n in range(len(batches)) for cue in batches[n]]
+        return merged(range(len(batches))), dict(failed)
 
     def run(self, media, options, keys, update, cancel):
         start, duration = options["clip_start"], options["clip_duration"]
         language = options["target_language"]
         source_language = options.get("source_language", "auto")
         skip_nonverbal = options.get("skip_nonverbal", False) and source_language == "ja"
-        translation_model = options.get("translation_model", TRANSLATION_MODEL)
-        translation_provider = options.get("translation_provider", "siliconflow")
-        translation_key = key_for(keys, translation_provider) if language != "original" else ""
+        translator = self.make_translator(options, keys) if language != "original" else None
         asr = self.make_asr(options, keys)
         stats = {"asr_requests": 0, "asr_cached": 0, "translation_requests": 0,
                  "translation_cached": 0, "uploaded_seconds": 0.0, "prompt_tokens": 0, "completion_tokens": 0,
-                 "filtered_segments": 0, "nonverbal_skipped": 0}
-        originals, translated, removed = [], [], []
+                 "filtered_segments": 0, "nonverbal_skipped": 0, "untranslated": 0}
+        originals, translated, removed, untranslated = [], [], [], {}
         estimated_wav_bytes = duration * 32000
         if shutil.disk_usage(self.work).free < estimated_wav_bytes + 100 * 1024 * 1024:
             raise UserError("本机剩余磁盘不足以提取这段音频，请缩短处理范围或释放空间。")
         with tempfile.TemporaryDirectory(prefix="subtitle-", dir=self.work) as temporary:
             wav = Path(temporary) / "audio.wav"
-            update(stage="正在本地提取音频", progress=0, stats=dict(stats))
-            actual_duration = self.extractor(media, wav, start, duration,
-                lambda ratio, label: update(stage=label, progress=round(min(ratio, 1) * 10, 1)), cancel)
-            check_cancel(cancel)
-            ranges = self.detector.detect(wav,
-                lambda ratio, label: update(stage=label, progress=round(10 + min(ratio, 1) * 15, 1)), cancel)
-            update(total_segments=len(ranges), duration_seconds=actual_duration, stage=f"准备识别 {len(ranges)} 句语音", progress=25)
-            if not ranges:
-                update(stage="未检测到语音，没有调用付费识别接口", progress=100, stats=dict(stats))
-                return "empty"
             halt, stats_lock = Event(), Lock()
             first_error = None
             traces = []
-            size = max(1, asr.batch_size)
-            batches = [list(range(i, min(i + size, len(ranges)))) for i in range(0, len(ranges), size)]
-
-            def recognize_batch(indices):
+            # A local model loads onto the graphics card while the audio is extracted and searched for speech.
+            warmup = Warmup(asr, cancel)
+            try:
+                update(stage="正在本地提取音频", progress=0, stats=dict(stats))
+                actual_duration = self.extractor(media, wav, start, duration,
+                    lambda ratio, label: update(stage=label, progress=round(min(ratio, 1) * 10, 1)), cancel)
                 check_cancel(cancel)
-                if halt.is_set():
-                    raise Cancelled("前序片段失败，已停止后续提交。")
-                results, pending = {}, []
-                for index in indices:
-                    audio = read_wav_segment(wav, ranges[index]["start"], ranges[index]["end"])
-                    cache_key = self.cache.key(asr.namespace, audio)
-                    cached = self.cache.get(cache_key)
-                    if isinstance(cached, dict) and isinstance(cached.get("text"), str):
-                        with stats_lock:
-                            stats["asr_cached"] += 1
-                        results[index] = (cached["text"], "")
-                    else:
-                        pending.append((index, audio, cache_key))
-                if pending:
+                ranges = self.detector.detect(wav,
+                    lambda ratio, label: update(stage=label, progress=round(10 + min(ratio, 1) * 15, 1)), cancel)
+                update(total_segments=len(ranges), duration_seconds=actual_duration, stage=f"准备识别 {len(ranges)} 句语音", progress=25)
+                if not ranges:
+                    update(stage="未检测到语音，没有调用付费识别接口", progress=100, stats=dict(stats))
+                    return "empty"
+                size = max(1, asr.batch_size)
+                batches = [list(range(i, min(i + size, len(ranges)))) for i in range(0, len(ranges), size)]
+
+                def recognize_batch(indices):
                     check_cancel(cancel)
                     if halt.is_set():
-                        raise Cancelled("已停止后续提交。")
-                    with stats_lock:
-                        stats["asr_requests"] += len(pending)
-                        if asr.uploads:
-                            stats["uploaded_seconds"] += sum(ranges[i]["end"] - ranges[i]["start"] for i, _, _ in pending)
-                    outputs = asr.transcribe_batch([audio for _, audio, _ in pending], cancel)
-                    for (index, _, cache_key), (text, trace) in zip(pending, outputs):
-                        self.cache.put(cache_key, {"text": text})
-                        results[index] = (text, trace)
-                return [({"id": i + 1, "start": start + ranges[i]["start"], "end": start + ranges[i]["end"],
-                          "text": clean_text(results[i][0])}, results[i][1]) for i in indices]
+                        raise Cancelled("前序片段失败，已停止后续提交。")
+                    results, pending = {}, []
+                    for index in indices:
+                        audio = read_wav_segment(wav, ranges[index]["start"], ranges[index]["end"])
+                        cache_key = self.cache.key(asr.namespace, audio)
+                        cached = self.cache.get(cache_key)
+                        if isinstance(cached, dict) and isinstance(cached.get("text"), str):
+                            with stats_lock:
+                                stats["asr_cached"] += 1
+                            results[index] = (cached["text"], "")
+                        else:
+                            pending.append((index, audio, cache_key))
+                    if pending:
+                        check_cancel(cancel)
+                        if halt.is_set():
+                            raise Cancelled("已停止后续提交。")
+                        with stats_lock:
+                            stats["asr_requests"] += len(pending)
+                            if asr.uploads:
+                                stats["uploaded_seconds"] += sum(ranges[i]["end"] - ranges[i]["start"] for i, _, _ in pending)
+                        outputs = asr.transcribe_batch([audio for _, audio, _ in pending], cancel)
+                        for (index, _, cache_key), (text, trace) in zip(pending, outputs):
+                            self.cache.put(cache_key, {"text": text})
+                            results[index] = (text, trace)
+                    return [({"id": i + 1, "start": start + ranges[i]["start"], "end": start + ranges[i]["end"],
+                              "text": clean_text(results[i][0])}, results[i][1]) for i in indices]
 
-            def recognize(indices):
-                try:
-                    return recognize_batch(indices)
-                except Exception:
-                    halt.set()
-                    raise
+                def recognize(indices):
+                    try:
+                        return recognize_batch(indices)
+                    except Exception:
+                        halt.set()
+                        raise
 
-            completed = 0
-            try:
-                asr.start(cancel, lambda label: update(stage=label))
+                completed = 0
+                warmup.wait(lambda label: update(stage=label))
                 with ThreadPoolExecutor(max_workers=asr.parallel, thread_name_prefix="subtitle-asr") as executor:
                     futures = [executor.submit(recognize, batch) for batch in batches]
                     for future in as_completed(futures):
@@ -559,6 +678,7 @@ class SubtitlePipeline:
                                processed_segments=completed, cached_segments=stats["asr_cached"], stats=dict(stats),
                                original_segments=list(originals), segments=current)
             finally:
+                warmup.stop()
                 asr.close()
             check_cancel(cancel)
             if first_error is not None:
@@ -566,20 +686,28 @@ class SubtitlePipeline:
             if not originals:
                 update(stage="语音识别未返回文字，没有生成空字幕", progress=100)
                 return "empty"
-            if language == "original":
+            if translator is None:
                 translated = [dict(cue) for cue in originals]
             else:
-                translated = self.translate_all(originals, language, source_language, translation_model,
-                                                translation_key, update, cancel, stats, traces,
-                                                options.get("context_hint", ""), translation_provider)
+                translated, untranslated = self.translate_all(originals, language, source_language, translator, update,
+                                                              cancel, stats, traces, options.get("context_hint", ""))
             check_cancel(cancel)
             update(stage="正在保存 SRT 字幕", progress=98, segments=translated, original_segments=originals)
+            note, suffix = TIME_AXIS_NOTE, ""
+            if untranslated:
+                note += (f" 有 {len(untranslated)} 句没有翻译成功（翻译服务拒绝了内容，或返回了无法使用的结果），"
+                         "这些句子保留了原文，在第 4 步的列表里会标出：可以手动翻译，或换一个翻译模型后重新生成"
+                         f"（已识别的语音会复用缓存）。原因示例：{next(iter(untranslated.values()))}")
+                suffix = f"（{len(untranslated)} 句未翻译，保留了原文）"
             engine = ASR_ENGINES[options.get("asr_engine", "siliconflow")]
             metadata = {"model": engine["model"], "asr_engine": options.get("asr_engine", "siliconflow"),
-                        "translation_model": translation_model if language != "original" else None,
-                        "translation_provider": translation_provider if language != "original" else None,
+                        "translation_model": translator.model if translator else None,
+                        "translation_provider": options.get("translation_provider", "siliconflow") if translator else None,
+                        "translation_endpoint": options.get("translation_endpoint") or None,
+                        "translation_format": options.get("translation_format") or None,
                         "source": str(media.path), "source_language": source_language,
                         "target_language": language, "time_axis": TIME_AXIS_NOTE, "removed_segments": removed,
+                        "untranslated_ids": sorted(untranslated),
                         "clip_start": start, "duration_seconds": actual_duration, "original_segments": originals,
                         "segments": translated, "stats": stats, "trace_ids": traces, "partial": False,
                         "style": options.get("style")}
@@ -587,8 +715,9 @@ class SubtitlePipeline:
                 saved = export_files(media, language, originals, translated, options["bilingual"], options["output_dir"],
                                      metadata, style=options.get("style"))
             except (OSError, UserError):
-                update(stage="字幕已生成，自动保存失败，请手动下载", progress=100, stats=dict(stats),
-                       warning=TIME_AXIS_NOTE + " 自动保存失败，请检查文件夹写入权限；可在客户端手动下载结果。")
+                update(stage="字幕已生成，自动保存失败，请手动下载" + suffix, progress=100, stats=dict(stats),
+                       warning=note + " 自动保存失败，请检查文件夹写入权限；可在客户端手动下载结果。")
             else:
-                update(stage="字幕生成完成，已保存到本机", progress=100, saved_files=saved, stats=dict(stats))
+                update(stage="字幕生成完成，已保存到本机" + suffix, progress=100, saved_files=saved, stats=dict(stats),
+                       warning=note)
             return "done"

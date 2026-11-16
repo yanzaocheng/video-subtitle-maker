@@ -9,6 +9,11 @@ gpu-env/
 gpu-setup/
 models/
 
+# Mosaic removal program (created by setup_lada.py)
+lada/
+lada-setup/
+lada.tmp/
+
 # Runtime data: contains your subtitles, video paths and preferences
 cache/
 history/

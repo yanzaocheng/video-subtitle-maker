@@ -1,7 +1,8 @@
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 import math
 import os
 import secrets
@@ -247,39 +248,114 @@ def probabilities_to_segments(probs, duration, threshold=0.5, silence_seconds=0.
     return [{"start": round(s, 6), "end": round(e, 6)} for s, e in padded if e > s]
 
 
+class AnyEvent:
+    """A cancel signal that is set when any of several events is."""
+
+    def __init__(self, *events):
+        self.events = events
+
+    def is_set(self):
+        return any(event.is_set() for event in self.events)
+
+
 class SpeechDetector:
+    """Silero VAD over a 16 kHz mono WAV file.
+
+    The model carries a state from frame to frame, so a file is one sequential stream. Long files are cut into
+    parts that run on several threads; each part first replays the minutes before it, because the state needs
+    that long to match an uninterrupted run (measured: 10 minutes give the same sentences as one stream).
+    """
+    CONTEXT = 64  # samples of the previous frame the model sees in front of each frame
+    BLOCK = 500  # frames read and analysed between two looks at the cancel signal
+    PART_SECONDS = 1800
+    WARMUP_SECONDS = 600
+
+    def __init__(self, workers=None):
+        self.workers = workers if workers is not None else max(1, min(6, (os.cpu_count() or 2) // 2))
+        self.session, self.lock = None, Lock()
+
+    def load(self):
+        with self.lock:
+            if self.session is None:
+                if not VAD_PATH.is_file():
+                    raise UserError("本机语音检测模型缺失，请恢复 assets/silero_vad_16k.onnx。")
+                options = ort.SessionOptions()
+                options.intra_op_num_threads = 1
+                options.inter_op_num_threads = 1
+                self.session = ort.InferenceSession(str(VAD_PATH), sess_options=options, providers=["CPUExecutionProvider"])
+            return self.session
+
+    def stream(self, session, wav_path, first, last, warmup, advance, cancel):
+        """Speech probability of the frames first..last; the model state starts `warmup` frames before them."""
+        begin, context = first - warmup, self.CONTEXT
+        probabilities = np.empty(last - first, dtype=np.float32)
+        feed = {"input": None, "state": np.zeros((2, 1, 128), dtype=np.float32), "sr": np.array(SAMPLE_RATE, dtype=np.int64)}
+        with wave.open(str(wav_path), "rb") as audio:
+            tail = np.zeros(context, dtype=np.float32)
+            if begin > 0:
+                audio.setpos(begin * FRAME_SAMPLES - context)
+                tail = np.frombuffer(audio.readframes(context), dtype="<i2").astype(np.float32) / 32768.0
+            for position in range(begin, last, self.BLOCK):
+                check_cancel(cancel)
+                count = min(self.BLOCK, last - position)
+                samples = np.frombuffer(audio.readframes(count * FRAME_SAMPLES), dtype="<i2").astype(np.float32) / 32768.0
+                # The last frame of the file is padded with silence.
+                block = np.zeros(context + count * FRAME_SAMPLES, dtype=np.float32)
+                block[:context] = tail
+                block[context:context + len(samples)] = samples
+                for index in range(count):
+                    offset = index * FRAME_SAMPLES
+                    feed["input"] = block[offset:offset + context + FRAME_SAMPLES].reshape(1, -1)
+                    output, feed["state"] = session.run(None, feed)
+                    if position + index >= first:
+                        probabilities[position + index - first] = output[0, 0]
+                tail = block[-context:].copy()
+                advance(count)
+        return probabilities
+
     def detect(self, wav_path, progress, cancel):
-        if not VAD_PATH.is_file():
-            raise UserError("本机语音检测模型缺失，请恢复 assets/silero_vad_16k.onnx。")
-        options = ort.SessionOptions()
-        options.intra_op_num_threads = 1
-        options.inter_op_num_threads = 1
-        session = ort.InferenceSession(str(VAD_PATH), sess_options=options, providers=["CPUExecutionProvider"])
-        state = np.zeros((2, 1, 128), dtype=np.float32)
-        context = np.zeros((1, 64), dtype=np.float32)
-        probabilities = []
+        session = self.load()
         with wave.open(str(wav_path), "rb") as audio:
             if (audio.getnchannels(), audio.getsampwidth(), audio.getframerate()) != (1, 2, SAMPLE_RATE):
                 raise UserError("本地音频格式不符合语音检测要求。")
             total = audio.getnframes()
-            duration = total / SAMPLE_RATE
-            frames = math.ceil(total / FRAME_SAMPLES)
-            for index in range(frames):
-                check_cancel(cancel)
-                data = audio.readframes(FRAME_SAMPLES)
-                samples = np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
-                if len(samples) < FRAME_SAMPLES:
-                    samples = np.pad(samples, (0, FRAME_SAMPLES - len(samples)))
-                chunk = np.concatenate((context, samples.reshape(1, -1)), axis=1)
-                output, state = session.run(None, {"input": chunk, "state": state, "sr": np.array(SAMPLE_RATE, dtype=np.int64)})
-                probability = float(output.reshape(-1)[0])
-                if not math.isfinite(probability):
-                    raise UserError("语音检测模型返回了无效结果。")
-                probabilities.append(probability)
-                context = chunk[:, -64:]
-                if index % max(1, frames // 100) == 0:
-                    progress((index + 1) / frames, f"检测语音：{min((index + 1) * FRAME_SAMPLES / SAMPLE_RATE, duration):.0f} / {duration:.0f} 秒")
-        segments = probabilities_to_segments(probabilities, duration)
+        duration = total / SAMPLE_RATE
+        frames = math.ceil(total / FRAME_SAMPLES)
+        parts = max(1, min(self.workers, int(duration // self.PART_SECONDS)))
+        size = max(1, math.ceil(frames / parts))
+        warmup = round(self.WARMUP_SECONDS * SAMPLE_RATE / FRAME_SAMPLES)
+        spans = [(first, min(frames, first + size), min(warmup, first)) for first in range(0, frames, size)]
+        work, done, lock = sum(last - first + warm for first, last, warm in spans), [0], Lock()
+        # The other parts stop as soon as one fails or the job is cancelled; the first error is the one reported.
+        failed, errors = Event(), []
+        stop = AnyEvent(cancel, failed)
+
+        def advance(count):
+            with lock:
+                done[0] += count
+                ratio = done[0] / work
+            progress(ratio, f"检测语音：{ratio * duration:.0f} / {duration:.0f} 秒")
+
+        def part(span):
+            try:
+                return self.stream(session, wav_path, *span, advance, stop)
+            except BaseException as exc:
+                with lock:
+                    if not failed.is_set():
+                        errors.append(exc)
+                    failed.set()
+
+        if len(spans) <= 1:
+            results = [part(span) for span in spans]
+        else:
+            with ThreadPoolExecutor(max_workers=len(spans), thread_name_prefix="speech-detect") as executor:
+                results = list(executor.map(part, spans))
+        if errors:
+            raise errors[0]
+        probabilities = np.concatenate(results) if results else np.empty(0, dtype=np.float32)
+        if not np.isfinite(probabilities).all():
+            raise UserError("语音检测模型返回了无效结果。")
+        segments = probabilities_to_segments(probabilities.tolist(), duration)
         progress(1, f"语音检测完成：按停顿合并为 {len(segments)} 句")
         return segments
 

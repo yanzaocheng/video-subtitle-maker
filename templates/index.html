@@ -41,6 +41,21 @@
         <div>
           <label class="field-label" for="translation-quality">翻译模型</label>
           <select id="translation-quality" disabled><option value="pro">硅基流动 · DeepSeek-V4-Pro（推荐）</option></select>
+          <div id="custom-api" class="custom-api" hidden>
+            <p class="muted">填写兼容 OpenAI 或 Anthropic 接口的服务：DeepSeek、OpenRouter、各类中转站，或本机的 Ollama、LM Studio。地址和模型保存在本机设置里，Key 保存在 Windows 凭据管理器，只会发给这个地址。</p>
+            <label class="field-label" for="custom-base-url">接口地址</label>
+            <input id="custom-base-url" type="text" inputmode="url" maxlength="500" spellcheck="false" autocomplete="off" placeholder="例如 https://api.deepseek.com/v1 或 http://localhost:11434/v1" disabled>
+            <label class="field-label spaced" for="custom-format">接口格式</label>
+            <select id="custom-format" disabled><option value="chat">Chat Completions（/chat/completions）· 多数服务和本机模型</option></select>
+            <p class="muted hint-note">不确定就用 Chat Completions。有的服务按模型分接口（例如 GPT 只走 Responses、Claude 只走 Messages），测试失败时错误信息里会写明。</p>
+            <label class="field-label spaced" for="custom-model">模型名称</label>
+            <input id="custom-model" type="text" maxlength="200" spellcheck="false" autocomplete="off" placeholder="例如 deepseek-chat、gpt-4o-mini、qwen2.5:14b" disabled>
+            <label class="field-label spaced" for="custom-key">API Key</label>
+            <input id="custom-key" type="password" maxlength="500" spellcheck="false" autocomplete="off" placeholder="本机模型可以留空" disabled>
+            <div class="action-row spaced-block"><button id="custom-save" disabled>保存</button><button id="custom-test" disabled>测试连接</button><button id="custom-clear" class="subtle" disabled>清除</button></div>
+            <p id="custom-note" class="muted hint-note"></p>
+            <p id="custom-message" role="status" aria-live="polite"></p>
+          </div>
           <label class="field-label spaced" for="context-hint">内容背景（可选）</label>
           <input id="context-hint" type="text" maxlength="200" spellcheck="false" autocomplete="off" placeholder="例如：日本综艺节目的访谈片段；人物：……" disabled>
           <p class="muted hint-note">告诉翻译模型视频类型和人物，帮助理解俚语、纠正误识别；会随字幕文本一起发送。</p>
@@ -77,6 +92,7 @@
           <label class="check-row inline"><input id="follow-playback" type="checkbox" checked>列表跟随播放</label>
           <span id="edit-state" class="muted" role="status"></span>
           <span class="toolbar-spacer"></span>
+          <button id="next-untranslated" title="这些句子的译文和原文相同：翻译服务拒绝了内容，或返回了无法使用的结果" hidden></button>
           <button id="restore-generated" hidden>恢复为生成版本</button>
           <button id="revert-edits" disabled>撤销未保存修改</button>
           <button id="save-edits" class="primary" disabled>保存修改</button>
@@ -102,8 +118,24 @@
       <p id="job-stats" class="muted"></p>
     </section>
 
+    <section class="panel" aria-labelledby="demosaic-heading">
+      <div class="section-heading"><h2 id="demosaic-heading"><span class="step">+</span>去马赛克（可选）</h2><span id="demosaic-meta" class="muted"></span></div>
+      <p class="muted">对第 1 步选择的视频，在本机显卡上找出马赛克区域并用 AI 重新绘制。这是按训练数据补画，不是还原原始画面：多数场景比较自然，部分场景会有伪影；打码的人脸会被跳过。原视频不改动，结果另存为“视频名.restored.mp4”，并自动为它复制一份已生成的字幕。</p>
+      <p id="demosaic-note" class="cost-note">正在检查去马赛克组件…</p>
+      <div class="action-row"><button id="demosaic-sample" disabled>试处理 60 秒</button><button id="demosaic-full" class="primary" disabled>处理整个视频</button><button id="demosaic-cancel" class="danger" disabled>取消去马赛克</button></div>
+      <p id="demosaic-hint" class="muted"></p>
+      <p id="demosaic-message" role="status" aria-live="polite"></p>
+      <div id="demosaic-progress-area" class="progress-box" hidden><div class="progress-heading"><strong id="demosaic-stage">等待处理</strong><span id="demosaic-progress-value">0%</span></div><progress id="demosaic-progress" max="100" value="0" aria-label="去马赛克进度"></progress><p id="demosaic-detail" class="muted"></p></div>
+      <div id="demosaic-result" hidden>
+        <ul id="demosaic-files" class="saved-files"></ul>
+        <div class="action-row spaced-block"><button id="demosaic-reveal">在文件夹中显示</button></div>
+        <video id="demosaic-video" controls preload="metadata" aria-label="去马赛克结果预览"></video>
+      </div>
+      <p class="muted">由开源项目 Lada（AGPL-3.0）在本机完成，作为独立程序调用，视频不上传。去马赛克和本地 GPU 识别不会同时占用显卡，后开始的一个会排队等待；云端识别不受影响。</p>
+    </section>
+
     <details class="panel settings"><summary>API Key 设置 <span id="key-status" class="muted">正在读取…</span></summary>
-      <p class="muted">Key 只保存在本机 Windows 凭据管理器，不回传已保存的 Key，不使用浏览器存储。输入框不会显示已保存的 Key。使用本地 GPU 识别并选择“原文”时不需要 Key。</p>
+      <p class="muted">Key 只保存在本机 Windows 凭据管理器，不回传已保存的 Key，不使用浏览器存储。输入框不会显示已保存的 Key。使用本地 GPU 识别并选择“原文”时不需要 Key。翻译想用别的服务，在第 2 步的“翻译模型”里选择“自定义 API”，它的地址和 Key 在那里设置。</p>
       <div class="key-block">
         <div class="key-title"><strong>硅基流动</strong><span id="key-status-siliconflow" class="muted"></span></div>
         <div class="key-row"><label class="sr-only" for="api-key-siliconflow">硅基流动 API Key</label><input id="api-key-siliconflow" type="password" autocomplete="off" spellcheck="false" placeholder="输入新的硅基流动 sk-… Key" disabled><button id="save-key-siliconflow" disabled>保存到本机</button><button id="clear-key-siliconflow" class="subtle" disabled>清除</button></div>
