@@ -19,7 +19,7 @@
 
 ## 特点
 
-**视频不出本机。** 在本地用 FFmpeg 提取音频，用 Silero VAD 按停顿切成整句。选择云端识别时只上传语音片段，翻译时只发送字幕文本。
+**视频不出本机。** 在本地用 FFmpeg 提取音频，用 FireRedVAD 和 Silero VAD 找出说话的地方、按停顿切成整句。选择云端识别时只上传语音片段，翻译时只发送字幕文本。
 
 **识别准，翻译懂上下文。** 语音识别用 Qwen3-ASR-1.7B，可选硅基流动或 DeepInfra 云端，也可以在本地 NVIDIA 显卡上免费运行。翻译用 DeepSeek，每批 20 句并附带前后文，会结合读音纠正同音误识别。
 
@@ -109,7 +109,28 @@ python -m venv .venv
 .venv\Scripts\python setup_local_gpu.py env Qwen3-ASR-1.7B-hf
 ```
 
-本地识别在单独的子进程中运行，任务结束后子进程退出并释放显存；显存不足时会自动减小批量。模型在提取音频、检测语音的同时加载到显卡；1 小时以上的音频分成几段并行检测语音，每段先重放它前面的 10 分钟（模型需要这么长的前文，实测分句结果和整段顺序检测相同）。实测在 RTX 3070（12 线程 CPU）上，一部 2 小时 43 分钟的视频：提取音频 6 秒，检测语音 17 秒，本地 1.7B 识别 427 句 49 秒，合计约 75 秒，翻译另计。
+本地识别在单独的子进程中运行，任务结束后子进程退出并释放显存；显存不足时会自动减小批量。模型在提取音频、检测语音的同时加载到显卡。
+
+### 语音检测
+
+先找出哪里有人说话，只把这些片段送去识别。用了两个模型，都在 CPU 上运行，不需要本地 GPU 环境：
+
+1. **Silero VAD 整段连续听一遍。** 1 小时以上的音频分成几段并行，每段先重放它前面的 10 分钟（模型需要这么长的前文，实测分句结果和整段顺序检测相同）。
+2. **Silero VAD 分成 10 秒的小窗口再听一遍，每个窗口都从空白状态开始。** Silero 的内部状态会记住前面几分钟听到的声音：听过清晰的对白之后，接下来较轻的、被水声或音乐盖住的对白会被它当成“不是语音”，整句整句地漏掉。小窗口没有这段记忆。
+3. **[FireRedVAD](https://github.com/FireRedTeam/FireRedVAD) 再听一遍。** 它听得比 Silero 更全，句子按它听到的地方切分。
+
+Silero 两遍都没听到、只有 FireRedVAD 听到的句子可信度较低（很多是呻吟或噪声），所以识别结果如果只有“うん”“はい”这类语气词就会被丢弃，有实际内容的才保留；界面的统计里显示“复查找回 N 句”。这些句子所在的地方噪声大，识别容易出错，建议试听校对。
+
+**怎么量的。** 用一部硬字幕视频（画面上压着字幕组的中文字幕）做参照：用 OCR 读出 1215 句中文字幕和时间，再让语言模型逐句判断同一时刻识别出的日文是否包含这句的意思。参照是意译，判断偏严，所以数字只适合比较方案：
+
+| 方案 | 意思对上 | 部分对上 | 不对 | 没有字幕 |
+| --- | --- | --- | --- | --- |
+| Silero 听两遍 | 26.7% | 19.4% | 32.4% | 21.4% |
+| 加上 FireRedVAD（现在的做法） | 31.0% | 21.2% | 37.7% | 10.0% |
+
+只用 Silero 一遍时，有字幕的参照句只占 55%。多找回来的主要是大声喊叫、低声和噪声里的短句，其中不少会认错，所以“不对”也升高了。同一批片段换成日语微调的 Qwen3-ASR（jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame）识别，逐句比较更好 149 句、更差 140 句，没有实际提升，所以没有换。
+
+**代价。** 送去识别的音频更多：这部 2 小时 5 分钟的视频从 53 分钟（866 句）增加到 88 分钟（1074 句），云端识别的费用也相应增加。在 RTX 3070（12 线程 CPU）上，提取音频 4 秒，检测语音 60 秒，本地 1.7B 识别 1074 句约 15 分钟（没有缓存时），翻译另计。
 
 ## 自定义翻译 API（可选）
 
@@ -155,7 +176,7 @@ Lada 以 AGPL-3.0 发布，本项目只把它当作独立程序（`lada-cli.exe`
 3. **生成字幕**：界面显示费用估算和进度，完成后自动保存到视频所在的文件夹。
 4. **预览与编辑字幕**：边看视频边改字、调时间和样式，保存后覆盖本次生成的字幕文件。
 
-时间轴来自本地语音检测，按停顿合并成整句（每条最长约 10 秒），不是逐字对齐，使用前请核对。
+时间轴来自本地语音检测，按停顿合并成整句（每条最长约 10 秒），不是逐字对齐，使用前请核对。被水声、音乐盖住的对白只能找回一部分，而且识别容易出错。
 
 ## 隐私与费用
 
@@ -171,7 +192,8 @@ Lada 以 AGPL-3.0 发布，本项目只把它当作独立程序（`lada-cli.exe`
 | --- | --- |
 | `app.py` | 本机 Flask 服务和接口 |
 | `subtitles.py` | 处理流程、批量翻译、SRT / ASS 生成 |
-| `media.py` | 读取媒体、FFmpeg 提取音频、Silero VAD 分句 |
+| `media.py` | 读取媒体、FFmpeg 提取音频、语音检测和分句 |
+| `firered_vad.py` | FireRedVAD 语音检测（NumPy 实现，含 Kaldi 滤波器组特征） |
 | `providers.py` | 硅基流动 / DeepInfra 接口，自定义 OpenAI 兼容接口 |
 | `local_asr.py`、`local_asr_worker.py` | 本地 GPU 识别子进程 |
 | `setup_local_gpu.py` | 一次性安装本地 GPU 环境和模型 |
@@ -179,7 +201,7 @@ Lada 以 AGPL-3.0 发布，本项目只把它当作独立程序（`lada-cli.exe`
 | `setup_lada.py` | 一次性下载并解压 Lada |
 | `launch.pyw`、`Start-ASR.cmd` | 启动服务并打开 Edge 窗口 |
 | `templates/`、`static/` | 界面 |
-| `assets/` | Silero VAD 模型 |
+| `assets/` | Silero VAD、FireRedVAD 模型 |
 | `test_app.py`、`test_subtitles.py`、`test_demosaic.py` | 测试 |
 
 ## 测试
@@ -192,6 +214,7 @@ Lada 以 AGPL-3.0 发布，本项目只把它当作独立程序（`lada-cli.exe`
 
 - [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-1.7B)（Apache-2.0）
 - [Silero VAD](https://github.com/snakers4/silero-vad)（MIT）：`assets/silero_vad_16k.onnx` 的许可证见 `assets/silero-LICENSE.txt`
+- [FireRedVAD](https://github.com/FireRedTeam/FireRedVAD)（Apache-2.0，小红书 FireRedTeam）：`assets/fireredvad.npz` 是它发布的 VAD 模型权重和 CMVN 统计量，从 `model.pth.tar` / `cmvn.ark` 转换成 NumPy 数组，数值未改动；推理代码 `firered_vad.py` 是对其 PyTorch 实现的重写。许可证见 `assets/fireredvad-LICENSE.txt`
 - [DeepSeek](https://www.deepseek.com)，通过硅基流动或 DeepInfra 调用
 - [Lada](https://github.com/ladaapp/lada)（AGPL-3.0）：去马赛克，作为独立程序调用，由 `setup_lada.py` 单独下载
 - [FFmpeg](https://ffmpeg.org)（通过 imageio-ffmpeg）、[PyAV](https://github.com/PyAV-Org/PyAV)、[ONNX Runtime](https://onnxruntime.ai)、[Flask](https://flask.palletsprojects.com)

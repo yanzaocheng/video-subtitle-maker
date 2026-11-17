@@ -17,6 +17,7 @@ import numpy as np
 import onnxruntime as ort
 
 from common import Cancelled, UserError, check_cancel
+from firered_vad import FireRedVad, to_grid
 
 ROOT = Path(__file__).resolve().parent
 VAD_PATH = ROOT / "assets" / "silero_vad_16k.onnx"
@@ -259,20 +260,34 @@ class AnyEvent:
 
 
 class SpeechDetector:
-    """Silero VAD over a 16 kHz mono WAV file.
+    """Finds the sentences of a 16 kHz mono WAV file with two models, Silero VAD and FireRedVAD.
 
-    The model carries a state from frame to frame, so a file is one sequential stream. Long files are cut into
-    parts that run on several threads; each part first replays the minutes before it, because the state needs
-    that long to match an uninterrupted run (measured: 10 minutes give the same sentences as one stream).
+    Silero hears the file twice. Once as one stream: the model carries a state from frame to frame. Long files are
+    cut into parts that run on several threads; each part first replays the minutes before it, because the state
+    needs that long to match an uninterrupted run (measured: 10 minutes give the same sentences as one stream).
+    That long memory has a price: after clear speech the model stops reporting speech that is quieter or covered by
+    noise (a shower, music) for minutes on end, and it cuts sentences short. So the file is heard a second time in
+    short windows that each start from an empty state, and a frame is speech when either pass says so.
+
+    FireRedVAD hears more still, so when its weights are there the sentences are cut where it hears speech, and
+    Silero says how sure that is. Measured against the burned-in Chinese subtitles of a 2-hour film: lines without
+    any subtitle of ours went from 21% to 10%, lines whose meaning was recognised from 27% to 31%.
+
+    A sentence that Silero does not support (only Silero's second pass, or only FireRedVAD, heard it) comes back
+    with "recovered": True: it is less certain (often a moan or noise), and the caller is stricter with it.
     """
     CONTEXT = 64  # samples of the previous frame the model sees in front of each frame
     BLOCK = 500  # frames read and analysed between two looks at the cancel signal
     PART_SECONDS = 1800
     WARMUP_SECONDS = 600
+    WINDOW_SECONDS = 10  # second pass: length of a window; they overlap by half and the higher probability counts
+    THRESHOLD = 0.5  # probability from which a frame is speech
 
-    def __init__(self, workers=None):
+    def __init__(self, workers=None, firered=None):
         self.workers = workers if workers is not None else max(1, min(6, (os.cpu_count() or 2) // 2))
         self.session, self.lock = None, Lock()
+        # False: Silero alone (as before FireRedVAD was added).
+        self.firered = FireRedVad() if firered is None else firered
 
     def load(self):
         with self.lock:
@@ -325,8 +340,41 @@ class SpeechDetector:
         size = max(1, math.ceil(frames / parts))
         warmup = round(self.WARMUP_SECONDS * SAMPLE_RATE / FRAME_SAMPLES)
         spans = [(first, min(frames, first + size), min(warmup, first)) for first in range(0, frames, size)]
+        firered = self.firered if self.firered and self.firered.available() else None
+        # Each pass is an equal share of the progress bar.
+        passes = 3 if firered else 2
+        results = self.analyse(session, wav_path, spans, cancel, lambda ratio: progress(
+            ratio / passes, f"检测语音：{ratio * duration:.0f} / {duration:.0f} 秒"))
+        stream = np.concatenate(results) if results else np.empty(0, dtype=np.float32)
+        fresh = self.windows(session, wav_path, frames, cancel, lambda ratio: progress(
+            (1 + ratio) / passes, f"复查低声和被噪声盖住的语音：{ratio * duration:.0f} / {duration:.0f} 秒"))
+        silero = np.maximum(stream, fresh)
+        if firered:
+            heard = to_grid(firered.probabilities(wav_path, self.workers, cancel, lambda ratio: progress(
+                (2 + ratio) / passes, f"用 FireRedVAD 再听一遍：{ratio * duration:.0f} / {duration:.0f} 秒")),
+                frames, FRAME_SAMPLES)
+            sure = silero
+        else:
+            heard, sure = silero, stream
+        if not (np.isfinite(heard).all() and np.isfinite(sure).all()):
+            raise UserError("语音检测模型返回了无效结果。")
+        segments = probabilities_to_segments(heard.tolist(), duration, threshold=self.THRESHOLD)
+        step = FRAME_SAMPLES / SAMPLE_RATE
+        for item in segments:
+            first = int(item["start"] / step)
+            if not (sure[first:max(first + 1, math.ceil(item["end"] / step))] >= self.THRESHOLD).any():
+                item["recovered"] = True
+        recovered = sum(1 for item in segments if item.get("recovered"))
+        label = f"语音检测完成：按停顿合并为 {len(segments)} 句"
+        if recovered:
+            label += f"，其中 {recovered} 句是复查时才找到的（低声、被噪声盖住，也可能只是语气声）"
+        progress(1, label)
+        return segments
+
+    def analyse(self, session, wav_path, spans, cancel, report):
+        """The probabilities of each span (first frame, last frame, warm-up frames), computed on several threads."""
         work, done, lock = sum(last - first + warm for first, last, warm in spans), [0], Lock()
-        # The other parts stop as soon as one fails or the job is cancelled; the first error is the one reported.
+        # The other spans stop as soon as one fails or the job is cancelled; the first error is the one reported.
         failed, errors = Event(), []
         stop = AnyEvent(cancel, failed)
 
@@ -334,7 +382,7 @@ class SpeechDetector:
             with lock:
                 done[0] += count
                 ratio = done[0] / work
-            progress(ratio, f"检测语音：{ratio * duration:.0f} / {duration:.0f} 秒")
+            report(ratio)
 
         def part(span):
             try:
@@ -345,19 +393,24 @@ class SpeechDetector:
                         errors.append(exc)
                     failed.set()
 
-        if len(spans) <= 1:
+        threads = min(self.workers, len(spans))
+        if threads <= 1:
             results = [part(span) for span in spans]
         else:
-            with ThreadPoolExecutor(max_workers=len(spans), thread_name_prefix="speech-detect") as executor:
+            with ThreadPoolExecutor(max_workers=threads, thread_name_prefix="speech-detect") as executor:
                 results = list(executor.map(part, spans))
         if errors:
             raise errors[0]
-        probabilities = np.concatenate(results) if results else np.empty(0, dtype=np.float32)
-        if not np.isfinite(probabilities).all():
-            raise UserError("语音检测模型返回了无效结果。")
-        segments = probabilities_to_segments(probabilities.tolist(), duration)
-        progress(1, f"语音检测完成：按停顿合并为 {len(segments)} 句")
-        return segments
+        return results
+
+    def windows(self, session, wav_path, frames, cancel, report):
+        """The probabilities of the second pass: half-overlapping windows that each start from an empty state."""
+        size = max(2, round(self.WINDOW_SECONDS * SAMPLE_RATE / FRAME_SAMPLES))
+        spans = [(first, min(frames, first + size), 0) for first in range(0, frames, size // 2)]
+        probabilities = np.zeros(frames, dtype=np.float32)
+        for (first, last, _), part in zip(spans, self.analyse(session, wav_path, spans, cancel, report)):
+            np.maximum(probabilities[first:last], part, out=probabilities[first:last])
+        return probabilities
 
 
 def read_wav_segment(path, start, end):

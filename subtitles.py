@@ -12,13 +12,14 @@ import tempfile
 import unicodedata
 
 from common import (ASR_ENGINES, PROVIDERS, Cancelled, LANGUAGES, MODEL, TRANSLATION_MODEL, UserError, check_cancel,
-                    is_nonverbal, language_matches)
+                    is_filler, is_nonverbal, language_matches)
 from local_asr import LocalAsrEngine
 from media import AnyEvent, SpeechDetector, extract_audio, read_wav_segment, video_size
 from providers import ContentError, CustomClient
 
 ROOT = Path(__file__).resolve().parent
-TIME_AXIS_NOTE = "本地 Silero VAD 按停顿合并的整句时间轴（每条最长约 10 秒），不是逐字强制对齐。低声、重叠对白需试听校对。"
+TIME_AXIS_NOTE = ("本地语音检测（FireRedVAD + Silero VAD）按停顿合并的整句时间轴（每条最长约 10 秒），不是逐字强制对齐。低声、重叠对白需试听校对；"
+                  "被水声、音乐盖住的对白能找回一部分，但识别容易出错。")
 TRANSLATION_BATCH = 20
 # A translation service is given up on once it has turned down this many lines and more lines than it translated.
 REFUSED_LINES_LIMIT = 20
@@ -582,7 +583,8 @@ class SubtitlePipeline:
         asr = self.make_asr(options, keys)
         stats = {"asr_requests": 0, "asr_cached": 0, "translation_requests": 0,
                  "translation_cached": 0, "uploaded_seconds": 0.0, "prompt_tokens": 0, "completion_tokens": 0,
-                 "filtered_segments": 0, "nonverbal_skipped": 0, "untranslated": 0}
+                 "filtered_segments": 0, "nonverbal_skipped": 0, "recovered_segments": 0, "recovered_skipped": 0,
+                 "untranslated": 0}
         originals, translated, removed, untranslated = [], [], [], {}
         estimated_wav_bytes = duration * 32000
         if shutil.disk_usage(self.work).free < estimated_wav_bytes + 100 * 1024 * 1024:
@@ -652,6 +654,8 @@ class SubtitlePipeline:
                     for future in as_completed(futures):
                         try:
                             for cue, trace in future.result():
+                                # Found only by the second, more sensitive pass of the speech detector.
+                                recovered = ranges[cue["id"] - 1].get("recovered", False)
                                 if cue["text"] and not language_matches(cue["text"], source_language):
                                     # Very short clips are sometimes recognised as another language.
                                     stats["filtered_segments"] += 1
@@ -659,7 +663,12 @@ class SubtitlePipeline:
                                 elif cue["text"] and skip_nonverbal and is_nonverbal(cue["text"]):
                                     stats["nonverbal_skipped"] += 1
                                     removed.append({**cue, "reason": "纯呻吟 / 喘息等语气声"})
+                                elif cue["text"] and recovered and is_filler(cue["text"]):
+                                    # A lone うん / はい there is nearly always a moan or noise, not an answer.
+                                    stats["recovered_skipped"] += 1
+                                    removed.append({**cue, "reason": "复查时找到的片段只有语气词，多半是语气声或噪声"})
                                 elif cue["text"]:
+                                    stats["recovered_segments"] += recovered
                                     originals.append(cue)
                                     originals.sort(key=lambda c: c["start"])
                                 if trace:

@@ -2,3 +2,4 @@
 *.cmd text eol=crlf
 *.onnx binary
 *.png binary
+*.npz binary

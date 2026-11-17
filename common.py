@@ -59,6 +59,21 @@ def is_nonverbal(text):
     if core in _MEANINGFUL:
         return False
     return not core or set(core) <= _NONVERBAL
+
+
+# Words that say nothing on their own (っ and ー are dropped before matching, so えっと is えと here).
+_FILLERS = re.compile(r"(?:うん|はい|ええ|そう|ねえ|へえ|ほう|まあ|なんか|えと|あの|yeah|yes|yep|okay|ok|oh|ah|uh|um|mm+|hm+|huh"
+                      r"|嗯|啊|哦|喔|呃|好|对|對|是|네|응|어|아|[" + "".join(sorted(_NONVERBAL)) + "])+", re.IGNORECASE)
+
+
+def is_filler(text):
+    """True for a line without content: sounds, a single character, or only words like うん / はい / yeah.
+
+    Such a line is kept when the speech detector was sure of it (it is somebody's answer), and dropped when it comes
+    from a stretch that had to be searched a second time, where it is usually a moan or noise.
+    """
+    core = "".join(c for c in text if c not in _IGNORABLE and not c.isspace())
+    return len(core) <= 1 or set(core) <= _NONVERBAL or _FILLERS.fullmatch(core) is not None
 LANGUAGES = {
     "original": "原文（不翻译）",
     "zh-CN": "简体中文",

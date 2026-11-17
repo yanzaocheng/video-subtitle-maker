@@ -674,7 +674,7 @@ function showJob(job) {
   const stats = job.stats;
   const recognition = job.local_asr ? `本地 GPU 识别 ${stats?.asr_requests ?? 0} 句` : `云端识别请求 ${stats?.asr_requests ?? 0} 次 · 已上传音频 ${formatDuration(stats?.uploaded_seconds ?? 0)}（非视频）`;
   const translation = job.translation_model_name ? ` · 翻译：${job.translation_model_name} · 请求 ${stats?.translation_requests ?? 0} 次（缓存 ${stats?.translation_cached ?? 0} 批）· token 输入 ${stats?.prompt_tokens ?? 0} / 输出 ${stats?.completion_tokens ?? 0}${stats?.untranslated ? ` · 未翻译 ${stats.untranslated} 句` : ''}` : '';
-  $('job-stats').textContent = stats ? `识别：${job.asr_engine_name || ''} · ${recognition} · 识别缓存 ${stats.asr_cached ?? 0} 句${translation} · 过滤误识别 ${stats.filtered_segments ?? 0} 句 · 跳过语气声 ${stats.nonverbal_skipped ?? 0} 句` : '';
+  $('job-stats').textContent = stats ? `识别：${job.asr_engine_name || ''} · ${recognition} · 识别缓存 ${stats.asr_cached ?? 0} 句${translation} · 过滤误识别 ${stats.filtered_segments ?? 0} 句 · 跳过语气声 ${(stats.nonverbal_skipped ?? 0) + (stats.recovered_skipped ?? 0)} 句${stats.recovered_segments ? ` · 复查找回 ${stats.recovered_segments} 句（低声或被噪声盖住，建议试听）` : ''}` : '';
   if (busy) {
     status(`${job.stage || '正在生成字幕'}${cancelRequested ? '\n已请求取消：等待当前请求结束，不要重复提交。' : '\n只会查询当前任务进度，不会自动重复提交。'}`);
     schedulePoll(job.id);

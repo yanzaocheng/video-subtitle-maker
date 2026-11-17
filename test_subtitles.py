@@ -13,7 +13,7 @@ import wave
 import imageio_ffmpeg
 import numpy as np
 
-from common import Cancelled, UserError, check_cancel, is_nonverbal, language_matches
+from common import Cancelled, UserError, check_cancel, is_filler, is_nonverbal, language_matches
 from media import Media, SpeechDetector, clip_range, extract_audio, probe_media, probabilities_to_segments
 from providers import (ContentError, CustomClient, SiliconFlowClient, custom_endpoint, parse_translation_payload,
                        parse_translations)
@@ -180,6 +180,30 @@ class PipelineTests(unittest.TestCase):
         self.options["skip_nonverbal"] = False
         self.run_pipeline()
         self.assertEqual(len(self.updates["segments"]), 2)
+
+    def test_sentences_found_on_the_second_listen_must_have_content(self):
+        # The short clip is the first range, the long one the second.
+        self.options.update(source_language="ja", target_language="original")
+        self.client.responder = lambda audio: "うん。" if len(audio) < 18000 else "先に入ってて。"
+        self.pipeline.detector = FixedDetector([{"start": 0.25, "end": 0.75, "recovered": True}, {"start": 1.25, "end": 1.9}])
+        self.assertEqual(self.run_pipeline(), "done")
+        self.assertEqual([c["text"] for c in self.updates["segments"]], ["先に入ってて。"])
+        self.assertEqual((self.updates["stats"]["recovered_skipped"], self.updates["stats"]["recovered_segments"]), (1, 0))
+        saved = next(Path(f["path"]) for f in self.updates["saved_files"] if f["kind"] == "json")
+        removed = json.loads(saved.read_text(encoding="utf-8"))["removed_segments"]
+        self.assertEqual([(r["text"], "复查" in r["reason"]) for r in removed], [("うん。", True)])
+        # The same answer is kept where the detector was sure of it, and a real sentence is kept either way.
+        self.pipeline.detector = FixedDetector([{"start": 0.25, "end": 0.75}, {"start": 1.25, "end": 1.9, "recovered": True}])
+        self.run_pipeline()
+        self.assertEqual([c["text"] for c in self.updates["segments"]], ["うん。", "先に入ってて。"])
+        self.assertEqual((self.updates["stats"]["recovered_skipped"], self.updates["stats"]["recovered_segments"]), (0, 1))
+        self.assertTrue(all("recovered" not in cue for cue in self.updates["segments"]))
+        # Sounds are dropped there even when the option to skip them is off.
+        self.options["skip_nonverbal"] = False
+        self.client.responder = lambda audio: "あっ、あぁ…" if len(audio) < 18000 else "先に入ってて。"
+        self.pipeline.detector = FixedDetector([{"start": 0.25, "end": 0.75, "recovered": True}, {"start": 1.25, "end": 1.9}])
+        self.run_pipeline()
+        self.assertEqual((len(self.updates["segments"]), self.updates["stats"]["recovered_skipped"]), (1, 1))
 
     def test_translation_gets_neighbour_context_model_and_language(self):
         self.options.update(source_language="ja", translation_model="test/model", clip_duration=2, context_hint="访谈")
@@ -466,6 +490,14 @@ class TimingAndTranslationTests(unittest.TestCase):
             self.assertTrue(is_nonverbal(text), text)
         for text in ("うん。", "ええ", "はい", "いい…", "イクっ", "やだ", "あっ、気持ちいい"):
             self.assertFalse(is_nonverbal(text), text)
+
+    def test_lines_without_content_are_recognised(self):
+        for text in ("うん。", "はい。", "うん、うん。", "うーん", "はい、はい。", "えっと。", "なんか。", "あ、あの。", "そうそうそう。",
+                     "か。", "で。", "あっ、あぁ…", "…。", "Yeah.", "Oh, okay.", "Mmm", "嗯嗯。", "好。"):
+            self.assertTrue(is_filler(text), text)
+        for text in ("先に入ってて。", "なんで隠すんだ。", "ああ、そうです。", "最高。", "見て。", "はい、お願いします。", "うん、行く。",
+                     "Yeah, right there.", "No.", "好的。"):
+            self.assertFalse(is_filler(text), text)
 
     def test_wrapping_keeps_manual_line_breaks(self):
         self.assertEqual(wrap_subtitle("第一行\n  第二行  \n\n第三行"), "第一行\n第二行\n第三行")
@@ -818,11 +850,13 @@ class SpeechDetectorTests(unittest.TestCase):
         return probabilities
 
     def probabilities(self, detector):
+        """What the stream pass alone gives: the second pass is replaced by one that finds nothing."""
         seen = {}
         def capture(probabilities, duration, **options):
             seen["probabilities"], seen["duration"] = probabilities, duration
             return []
         progress = []
+        detector.windows = lambda session, wav, frames, cancel, report: np.zeros(frames, dtype=np.float32)
         with patch("media.probabilities_to_segments", capture):
             detector.detect(self.wav, lambda ratio, label: progress.append(ratio), Event())
         self.assertEqual(progress[-1], 1)
@@ -830,7 +864,7 @@ class SpeechDetectorTests(unittest.TestCase):
         return seen["probabilities"], seen["duration"]
 
     def test_one_stream_gives_exactly_the_frame_by_frame_result(self):
-        detector = SpeechDetector(workers=4)
+        detector = SpeechDetector(workers=4, firered=False)
         detector.BLOCK = 7  # several blocks, the last one short
         probabilities, duration = self.probabilities(detector)
         self.assertEqual(probabilities, self.reference())
@@ -838,7 +872,7 @@ class SpeechDetectorTests(unittest.TestCase):
 
     def test_long_files_are_split_and_each_part_replays_what_came_before(self):
         reference = self.reference()
-        detector = SpeechDetector(workers=3)
+        detector = SpeechDetector(workers=3, firered=False)
         detector.PART_SECONDS, detector.WARMUP_SECONDS = 5, 2
         probabilities, _ = self.probabilities(detector)
         size = -(-len(reference) // 3)
@@ -846,10 +880,10 @@ class SpeechDetectorTests(unittest.TestCase):
         # The first part starts like the single stream; later parts start from a short replay and only come close.
         self.assertEqual(probabilities[:size], reference[:size])
         self.assertNotEqual(probabilities, reference)
-        whole = SpeechDetector(workers=3)
+        whole = SpeechDetector(workers=3, firered=False)
         whole.PART_SECONDS, whole.WARMUP_SECONDS = 5, 1000
         self.assertEqual(self.probabilities(whole)[0], reference)
-        self.assertEqual(self.probabilities(SpeechDetector(workers=1))[0], reference)
+        self.assertEqual(self.probabilities(SpeechDetector(workers=1, firered=False))[0], reference)
 
     def test_cancel_stops_every_part(self):
         detector = SpeechDetector(workers=3)
@@ -861,6 +895,168 @@ class SpeechDetectorTests(unittest.TestCase):
         with self.assertRaises(Cancelled):
             detector.detect(self.wav, progress, cancel)
         self.assertLess(len(calls), 12)
+
+    def fresh(self, first, last):
+        """Frame-by-frame probabilities of frames first..last from an empty state."""
+        import onnxruntime as ort
+        from media import VAD_PATH
+        session = ort.InferenceSession(str(VAD_PATH), providers=["CPUExecutionProvider"])
+        padded = np.concatenate((np.zeros(64, dtype=np.float32), self.samples.astype(np.float32) / 32768.0, np.zeros(512, dtype=np.float32)))
+        state, probabilities = np.zeros((2, 1, 128), dtype=np.float32), []
+        for index in range(first, last):
+            output, state = session.run(None, {"input": padded[index * 512:index * 512 + 576].reshape(1, -1), "state": state,
+                                               "sr": np.array(16000, dtype=np.int64)})
+            probabilities.append(float(output.reshape(-1)[0]))
+        return probabilities
+
+    def test_second_pass_hears_overlapping_windows_that_each_start_empty(self):
+        detector = SpeechDetector(workers=3)
+        detector.WINDOW_SECONDS = 4  # 125 frames, a new window every 62
+        frames = -(-len(self.samples) // 512)
+        reports = []
+        probabilities = detector.windows(detector.load(), self.wav, frames, Event(), reports.append)
+        expected = np.zeros(frames, dtype=np.float32)
+        for first in range(0, frames, 62):
+            last = min(frames, first + 125)
+            expected[first:last] = np.maximum(expected[first:last], np.array(self.fresh(first, last), dtype=np.float32))
+        self.assertEqual(probabilities.tolist(), expected.tolist())
+        self.assertAlmostEqual(max(reports), 1)
+        # A window that starts later differs from the stream: the state is what the second pass leaves behind.
+        self.assertNotEqual(probabilities.tolist(), self.reference())
+
+    def test_either_pass_makes_a_sentence_and_those_of_the_second_alone_are_marked(self):
+        detector = SpeechDetector(workers=1, firered=False)
+        frames = -(-len(self.samples) // 512)
+        stream, fresh = np.zeros(frames, dtype=np.float32), np.zeros(frames, dtype=np.float32)
+        stream[100:150] = 0.9  # 3.2 to 4.8 s
+        fresh[95:160] = 0.8  # the same sentence, heard a little longer
+        fresh[300:340] = 0.7  # 9.6 to 10.9 s: only the second pass hears it
+        fresh[500:520] = 0.4  # below the threshold
+        detector.analyse = lambda session, wav, spans, cancel, report: [stream]
+        detector.windows = lambda session, wav, frames, cancel, report: fresh
+        labels = []
+        segments = detector.detect(self.wav, lambda ratio, label: labels.append(label), Event())
+        self.assertEqual(segments, [{"start": 2.96, "end": 5.22}, {"start": 9.52, "end": 10.98, "recovered": True}])
+        self.assertIn("2 句，其中 1 句是复查时才找到的", labels[-1])
+
+    def test_all_passes_run_on_real_audio(self):
+        progress = []
+        segments = SpeechDetector(workers=2).detect(self.wav, lambda ratio, label: progress.append((ratio, label)), Event())
+        self.assertEqual(progress[-1][0], 1)
+        self.assertTrue(all(0 < ratio <= 1 for ratio, _ in progress))
+        self.assertTrue(all(a <= b for (a, _), (b, _) in zip(progress, progress[1:])))
+        self.assertTrue(any("复查" in label for _, label in progress[:-1]))
+        self.assertTrue(any("FireRedVAD" in label for _, label in progress[:-1]))
+        # The test audio is bursts of white noise: Silero takes some for speech, FireRedVAD does not.
+        self.assertEqual(segments, [])
+        self.assertTrue(all(a["end"] <= b["start"] for a, b in zip(segments, segments[1:])))
+
+    def test_firered_cuts_the_sentences_and_silero_says_how_sure_they_are(self):
+        detector = SpeechDetector(workers=1)
+        frames = -(-len(self.samples) // 512)
+        stream, fresh = np.zeros(frames, dtype=np.float32), np.zeros(frames, dtype=np.float32)
+        stream[100:150] = 0.9  # 3.2 to 4.8 s
+        fresh[300:340] = 0.7  # 9.6 to 10.9 s: only Silero's second pass
+        stream[560:580] = 0.9  # 17.9 to 18.6 s: Silero only, FireRedVAD hears nothing
+        heard = np.zeros(-(-len(self.samples) // 160), dtype=np.float32)
+        heard[300:500] = 0.95  # 3 to 5 s
+        heard[960:1090] = 0.9  # 9.6 to 10.9 s
+        heard[1500:1560] = 0.8  # 15 to 15.6 s: FireRedVAD alone
+        calls = []
+        class Fake:
+            def available(self): return True
+            def probabilities(self, wav, workers, cancel, report):
+                calls.append(workers)
+                report(0.5)
+                report(1.0)
+                return heard
+        detector.firered = Fake()
+        detector.analyse = lambda session, wav, spans, cancel, report: [stream]
+        detector.windows = lambda session, wav, frames, cancel, report: fresh
+        progress = []
+        segments = detector.detect(self.wav, lambda ratio, label: progress.append((ratio, label)), Event())
+        self.assertEqual(calls, [1])
+        self.assertEqual([(round(s["start"], 2), round(s["end"], 2), s.get("recovered", False)) for s in segments],
+                         [(2.9, 5.09, False), (9.52, 11.01, False), (14.9, 15.72, True)])
+        self.assertEqual(progress[-2][0], 1)
+        self.assertIn("用 FireRedVAD 再听一遍", progress[-3][1])
+        self.assertIn("3 句，其中 1 句是复查时才找到的", progress[-1][1])
+
+    def test_without_firered_weights_silero_alone_decides(self):
+        from firered_vad import FireRedVad
+        detector = SpeechDetector(workers=1, firered=FireRedVad(Path(self.temp.name) / "missing.npz"))
+        silero = SpeechDetector(workers=1, firered=False)
+        labels = []
+        self.assertEqual(detector.detect(self.wav, lambda ratio, label: labels.append(label), Event()),
+                         silero.detect(self.wav, lambda ratio, label: None, Event()))
+        self.assertFalse(any("FireRedVAD" in label for label in labels))
+
+
+class FireRedVadTests(unittest.TestCase):
+    """The NumPy port against values of the original code (kaldi-native-fbank 1.23 and FireRedVAD 0.0.2 on PyTorch)."""
+
+    @staticmethod
+    def signal(seconds):
+        t = np.arange(int(16000 * seconds)) / 16000
+        voice = sum(np.sin(2 * np.pi * 150 * k * t) / k for k in range(1, 12)) * (0.5 + 0.5 * np.sin(2 * np.pi * 3 * t))
+        gate = np.sin(2 * np.pi * 0.4 * t) > -0.3
+        return (4000 * voice * gate + 300 * np.sin(2 * np.pi * 2900 * t * t)).astype("<i2")
+
+    def test_filterbank_matches_kaldi(self):
+        from firered_vad import kaldi_fbank
+        features = kaldi_fbank(self.signal(4.0))
+        self.assertEqual(features.shape, (398, 80))
+        expected = [[13.7958, 18.9593, 9.288, 5.6993], [9.9996, 15.6973, 6.8539, 6.789],
+                    [11.9732, 18.0012, 8.402, 5.9539], [0.8482, -0.2038, 2.6713, 7.3555]]
+        np.testing.assert_allclose(features[np.ix_([0, 120, 250, 397], [0, 9, 40, 79])], expected, atol=2e-3)
+        self.assertEqual(kaldi_fbank(np.zeros(399, dtype="<i2")).shape, (0, 80))
+        self.assertEqual(kaldi_fbank(np.zeros(400, dtype="<i2")).shape, (1, 80))
+
+    def test_network_matches_the_original(self):
+        from firered_vad import FireRedVad, kaldi_fbank
+        probabilities = FireRedVad().forward(kaldi_fbank(self.signal(4.0)))
+        expected = [0.35384, 0.87098, 0.71122, 0.00133, 0.00137, 0.4978, 0.01303]
+        np.testing.assert_allclose(probabilities[[0, 40, 100, 160, 220, 300, 397]], expected, atol=1e-4)
+
+    def test_long_files_are_heard_in_independent_pieces_on_several_threads(self):
+        import firered_vad
+        from firered_vad import FireRedVad, kaldi_fbank
+        samples = self.signal(10.0)
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "audio.wav"
+            with wave.open(str(path), "wb") as target:
+                target.setnchannels(1); target.setsampwidth(2); target.setframerate(16000)
+                target.writeframes(samples.tobytes())
+            model = FireRedVad()
+            features = kaldi_fbank(samples)
+            with patch.object(firered_vad, "CHUNK_FRAMES", 300):
+                expected = np.concatenate([model.forward(features[first:first + 300]) for first in range(0, len(features), 300)])
+                reports = []
+                for workers in (1, 3):
+                    got = model.probabilities(path, workers, Event(), reports.append)
+                    np.testing.assert_allclose(got, expected, atol=1e-6)
+                self.assertEqual(max(reports), 1)
+                # Pieces are heard without each other, so the edges differ from one whole pass.
+                self.assertGreater(np.abs(expected - model.forward(features)).max(), 1e-3)
+                cancel = Event()
+                cancel.set()
+                with self.assertRaises(Cancelled):
+                    model.probabilities(path, 2, cancel, reports.append)
+
+    def test_probabilities_go_onto_the_coarser_grid_as_the_highest_value(self):
+        from firered_vad import to_grid
+        # 10 ms frames onto 32 ms frames: frame i starts at i * 160 samples, inside grid frame i * 160 // 512.
+        grid = to_grid(np.array([0.1, 0.9, 0.2, 0.3, 0.8, 0.4, 0.5], dtype=np.float32), 2, 512)
+        self.assertEqual(grid.tolist(), [np.float32(0.9), np.float32(0.8)])
+        self.assertEqual(to_grid(np.zeros(0, dtype=np.float32), 3, 512).tolist(), [0, 0, 0])
+
+    def test_damaged_weights_are_reported(self):
+        from firered_vad import FireRedVad
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "fireredvad.npz"
+            path.write_bytes(b"not a model")
+            with self.assertRaises(UserError):
+                FireRedVad(path).load()
 
 
 FAKE_WORKER = r'''
